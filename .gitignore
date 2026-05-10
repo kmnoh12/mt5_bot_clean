@@ -1,0 +1,33 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime/logs/state
+*.log
+*.tmp
+*.bak
+*.backup
+*.old
+mt5_bot/memory/daily/*.md
+mt5_bot/memory/reinforcement_log.md
+mt5_bot/runtime.lock
+mt5_bot/dashboard_settings.local.json
+
+# Secrets/local config
+.env
+.env.*
+*.pem
+*.key
+config.local.yaml
+mt5_bot/config.local.yaml
+mt5_bot/config_legacy_lsr_tick.yaml
+
+# Archives
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz

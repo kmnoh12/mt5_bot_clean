@@ -1,0 +1,16 @@
+{
+  "llm_assist": {
+    "enabled": true,
+    "provider": "gemini",
+    "model": "gemini-3-flash",
+    "api_key_env": "GEMINI_API_KEY",
+    "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "api_key": ""
+  },
+  "risk_guard": {
+    "risk_per_trade_pct": 0.05,
+    "daily_loss_limit_pct": 0.1,
+    "session_loss_limit_pct": 0.12,
+    "max_consecutive_losses": 5
+  }
+}
