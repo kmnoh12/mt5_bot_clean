@@ -1,12 +1,12 @@
 mt5:
   init_timeout_ms: 60000
-  login:  null
+  login: 410663362
   server_time_offset_hours: 2.0
-  server:  "YOUR_BROKER_SERVER"
-  password:  "CHANGE_ME"
+  server: "XMGlobal-MT5 16"
+  password: "" # Saved in MT5 terminal
   max_spread_points: 1200
   attach_only: true
-  allow_programmatic_login:  false
+  allow_programmatic_login: false
   allow_terminal_launch: true
   close_terminal_on_exit: true
   account_guard_enabled: true
@@ -171,7 +171,7 @@ llm_assist:
   enabled: false
   provider: "gemini"
   model: "gemini-3-flash"
-  api_key:  ""
+  api_key: ""
   api_key_env: "GEMINI_API_KEY"
   base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
   timeout_ms: 800
