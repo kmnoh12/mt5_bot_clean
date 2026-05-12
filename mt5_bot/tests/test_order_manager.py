@@ -133,6 +133,44 @@ class _FakeBroker(BrokerGateway):
 
 
 class OrderManagerTests(unittest.TestCase):
+    def test_dry_run_entry_does_not_call_broker_precheck(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broker = _FakeBroker(fail_first_precheck=True)
+            store = JsonStore(
+                state_path=Path(tmpdir) / "state.json",
+                events_path=Path(tmpdir) / "events.jsonl",
+            )
+            risk = RiskEngine({"risk_per_trade_pct": 0.015, "dynamic_lot_enabled": False})
+            manager = OrderManager(
+                broker=broker,
+                store=store,
+                notifier=_NoopNotifier(),
+                execution_cfg={"default_volume": 0.1},
+                risk_engine=risk,
+                dry_run=True,
+            )
+
+            decision = StrategyDecision(
+                action=DecisionAction.BUY,
+                reason="TEST_DRY_ENTRY",
+                strategy="trend_regime_sm",
+                sl=99.0,
+                tp=102.0,
+                metadata={"signal_close": 100.0},
+            )
+            result = manager.process_decision(
+                instrument={"symbol": "BTCUSD", "volume": 0.2},
+                decision=decision,
+                current_position=None,
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertTrue(result.ok)
+            self.assertEqual(result.status, "DRY_ENTRY")
+            self.assertEqual(broker.precheck_calls, 0)
+            self.assertIsNone(broker.last_intent)
+
     def test_entry_uses_sltp_and_retries_on_10014(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             broker = _FakeBroker()

@@ -1011,87 +1011,87 @@ class OrderManager:
             metadata={**decision.metadata, **plan_meta},
         )
 
-        precheck = self.broker.precheck_order(intent)
-        precheck_retry_meta: Optional[Dict[str, Any]] = None
-        if not precheck.ok and int(precheck.retcode or 0) == 10014:
-            intent.volume = self.risk_engine.repair_volume_for_10014(constraints)
-            precheck = self.broker.precheck_order(intent)
-
-        if not precheck.ok and int(precheck.retcode or 0) == 10016:
-            precheck_retry_meta = self._adjust_stops_for_constraints(
-                intent=intent,
-                constraints=constraints,
-                symbol=symbol,
-            )
-            if precheck_retry_meta is not None:
-                precheck = self.broker.precheck_order(intent)
-                self.store.append_event(
-                    {
-                        "event": "order_stops_auto_adjusted",
-                        "symbol": symbol,
-                        "strategy": strategy,
-                        "phase": "precheck",
-                        "adjustment": precheck_retry_meta,
-                        "result": precheck.__dict__,
-                        "recheck": True,
-                    }
-                )
-                if not precheck.ok and int(precheck.retcode or 0) == 10016:
-                    second_floor = float(precheck_retry_meta.get("min_distance_points", 0.0) or 0.0) * 2.0
-                    precheck_retry_meta_2 = self._adjust_stops_for_constraints(
-                        intent=intent,
-                        constraints=constraints,
-                        symbol=symbol,
-                        min_distance_points_override=second_floor,
-                    )
-                    if precheck_retry_meta_2 is not None:
-                        precheck = self.broker.precheck_order(intent)
-                        self.store.append_event(
-                            {
-                                "event": "order_stops_auto_adjusted",
-                                "symbol": symbol,
-                                "strategy": strategy,
-                                "phase": "precheck_retry2",
-                                "adjustment": precheck_retry_meta_2,
-                                "result": precheck.__dict__,
-                                "recheck": True,
-                            }
-                        )
-
-        if not precheck.ok:
-            self.risk_engine.on_order_result(precheck)
-            self.store.append_event(
-                {
-                    "event": "order_submit",
-                    "symbol": symbol,
-                    "strategy": strategy,
-                    "action": decision.action.value,
-                    "reason": decision.reason,
-                    "intent": intent.__dict__,
-                    "result": precheck.__dict__,
-                    "phase": "precheck",
-                }
-            )
-            if precheck_retry_meta is not None:
-                self.store.append_event(
-                    {
-                        "event": "order_stops_auto_adjusted",
-                        "symbol": symbol,
-                        "strategy": strategy,
-                        "phase": "precheck_failed",
-                        "adjustment": precheck_retry_meta,
-                        "result": precheck.__dict__,
-                    }
-                )
-            self._emit_broker_request_events(symbol=symbol, strategy=strategy, phase="precheck", result=precheck)
-            self._notify_error(
-                f"{symbol} {decision.action.value} PRECHECK FAILED {strategy} | {precheck.status} | {precheck.message}"
-            )
-            return precheck
-
         if self.dry_run:
             result = self._dry_result("DRY_ENTRY", decision)
         else:
+            precheck = self.broker.precheck_order(intent)
+            precheck_retry_meta: Optional[Dict[str, Any]] = None
+            if not precheck.ok and int(precheck.retcode or 0) == 10014:
+                intent.volume = self.risk_engine.repair_volume_for_10014(constraints)
+                precheck = self.broker.precheck_order(intent)
+
+            if not precheck.ok and int(precheck.retcode or 0) == 10016:
+                precheck_retry_meta = self._adjust_stops_for_constraints(
+                    intent=intent,
+                    constraints=constraints,
+                    symbol=symbol,
+                )
+                if precheck_retry_meta is not None:
+                    precheck = self.broker.precheck_order(intent)
+                    self.store.append_event(
+                        {
+                            "event": "order_stops_auto_adjusted",
+                            "symbol": symbol,
+                            "strategy": strategy,
+                            "phase": "precheck",
+                            "adjustment": precheck_retry_meta,
+                            "result": precheck.__dict__,
+                            "recheck": True,
+                        }
+                    )
+                    if not precheck.ok and int(precheck.retcode or 0) == 10016:
+                        second_floor = float(precheck_retry_meta.get("min_distance_points", 0.0) or 0.0) * 2.0
+                        precheck_retry_meta_2 = self._adjust_stops_for_constraints(
+                            intent=intent,
+                            constraints=constraints,
+                            symbol=symbol,
+                            min_distance_points_override=second_floor,
+                        )
+                        if precheck_retry_meta_2 is not None:
+                            precheck = self.broker.precheck_order(intent)
+                            self.store.append_event(
+                                {
+                                    "event": "order_stops_auto_adjusted",
+                                    "symbol": symbol,
+                                    "strategy": strategy,
+                                    "phase": "precheck_retry2",
+                                    "adjustment": precheck_retry_meta_2,
+                                    "result": precheck.__dict__,
+                                    "recheck": True,
+                                }
+                            )
+
+            if not precheck.ok:
+                self.risk_engine.on_order_result(precheck)
+                self.store.append_event(
+                    {
+                        "event": "order_submit",
+                        "symbol": symbol,
+                        "strategy": strategy,
+                        "action": decision.action.value,
+                        "reason": decision.reason,
+                        "intent": intent.__dict__,
+                        "result": precheck.__dict__,
+                        "phase": "precheck",
+                    }
+                )
+                if precheck_retry_meta is not None:
+                    self.store.append_event(
+                        {
+                            "event": "order_stops_auto_adjusted",
+                            "symbol": symbol,
+                            "strategy": strategy,
+                            "phase": "precheck_failed",
+                            "adjustment": precheck_retry_meta,
+                            "result": precheck.__dict__,
+                        }
+                    )
+                self._emit_broker_request_events(symbol=symbol, strategy=strategy, phase="precheck", result=precheck)
+                self._notify_error(
+                    f"{symbol} {decision.action.value} PRECHECK FAILED {strategy} | {precheck.status} | {precheck.message}"
+                )
+                return precheck
+
             result = self.broker.send_order(intent)
             if not result.ok and int(result.retcode or 0) == 10014:
                 intent.volume = self.risk_engine.repair_volume_for_10014(constraints)

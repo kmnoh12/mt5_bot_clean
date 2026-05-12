@@ -55,7 +55,9 @@ class TradingRuntime:
 
         general = self.config.get("general", {})
         self.mode = BotMode(str(general.get("mode", BotMode.LIVE.value)))
-        self.dry_run = bool(general.get("dry_run", True))
+        self._assert_live_readiness_before_startup()
+        execution_cfg = self.config.get("execution", {}) if isinstance(self.config.get("execution", {}), dict) else {}
+        self.dry_run = bool(general.get("dry_run", True) or execution_cfg.get("dry_run", False))
         self.poll_seconds = max(0.1, float(general.get("poll_seconds", 1)))
         self.heartbeat_seconds = max(1, int(general.get("heartbeat_seconds", 10)))
         self.bars_per_request = max(50, int(general.get("bars_per_request", 300)))
@@ -87,8 +89,9 @@ class TradingRuntime:
             self.broker = MT5LiveGateway(self.config, notifier=self.notifier)
 
         # risk + execution
+        risk_cfg = self._effective_risk_guard_config()
         self.risk_engine = RiskEngine(
-            self.config.get("risk_guard", {}),
+            risk_cfg,
             snapshot=dict(self.state.get("risk_guard", {})) if isinstance(self.state.get("risk_guard"), dict) else {},
         )
         self.trailing_guard = DynamicTrailingProfitGuard(
@@ -771,11 +774,30 @@ class TradingRuntime:
                 pass
         self.control_channel = RuntimeControlChannel(path=control_path)
 
+    def _effective_risk_guard_config(self) -> Dict[str, Any]:
+        risk_cfg = dict(self.config.get("risk_guard", {}) or {})
+        if self.mode == BotMode.BACKTEST:
+            risk_cfg["dynamic_lot_enabled"] = False
+        return risk_cfg
+
+    def _assert_live_readiness_before_startup(self) -> None:
+        if self.mode != BotMode.LIVE:
+            return
+        validation_cfg = self.config.get("validation", {}) or {}
+        report_path = str(validation_cfg.get("report_path", ""))
+        require_oos = bool(validation_cfg.get("require_oos_pass", False))
+        if not require_oos:
+            return
+        ok, reason = check_live_readiness(report_path)
+        if not ok:
+            raise ValueError(f"Live readiness failed: {reason}")
+
     def _apply_runtime_config(self, next_config: Dict[str, Any], source: str) -> None:
         self.config = self._normalize_runtime_universe(next_config or {})
 
         general = self.config.get("general", {})
-        self.dry_run = bool(general.get("dry_run", self.dry_run))
+        execution_cfg = self.config.get("execution", {}) if isinstance(self.config.get("execution", {}), dict) else {}
+        self.dry_run = bool(general.get("dry_run", self.dry_run) or execution_cfg.get("dry_run", False))
         self.poll_seconds = max(0.1, float(general.get("poll_seconds", self.poll_seconds)))
         self.heartbeat_seconds = max(1, int(general.get("heartbeat_seconds", self.heartbeat_seconds)))
         self.bars_per_request = max(50, int(general.get("bars_per_request", self.bars_per_request)))
@@ -785,7 +807,11 @@ class TradingRuntime:
             float(general.get("daily_reference_refresh_seconds", self._daily_reference_refresh_interval_seconds)),
         )
 
-        self.risk_engine.update_config(self.config.get("risk_guard", {}))
+        update_order_gate = getattr(self.broker, "update_order_gate", None)
+        if callable(update_order_gate):
+            update_order_gate(self.config)
+
+        self.risk_engine.update_config(self._effective_risk_guard_config())
         self.trailing_guard.update_config(self.config.get("trailing_profit_guard", {}))
         self.manual_position_guard.update_config(self.config.get("manual_position_guard", {}))
         self.execution_churn_guard.update_config(self.config.get("execution_churn_guard", {}))
@@ -1483,7 +1509,7 @@ class TradingRuntime:
 
         # dashboard control
         ctrl: Dict[str, Any] = {}
-        if self.control_channel is not None:
+        if self.dashboard_enabled and self.control_channel is not None:
             ctrl = self.control_channel.load()
             if ctrl.get("manual_halt"):
                 write_desired_state(

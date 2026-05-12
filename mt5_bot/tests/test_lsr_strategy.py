@@ -29,6 +29,9 @@ class LiquiditySweepReversalStrategyTests(unittest.TestCase):
                 "max_hold_bars": 100,
                 "min_hold_bars": 1,
                 "min_cooldown_bars": 1,
+                "fvg_enabled": False,
+                "retest_enabled": False,
+                "trail_tp_enabled": False,
             }
         )
 

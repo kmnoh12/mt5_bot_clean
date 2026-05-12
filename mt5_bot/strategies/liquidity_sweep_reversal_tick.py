@@ -225,6 +225,11 @@ class LiquiditySweepReversalTickStrategy(BaseStateMachineStrategy):
         min_hold_bars = max(1, self._to_int(cfg.get("min_hold_bars", defaults.get("min_hold_bars", 1)), 1))
         min_cooldown_bars = max(1, self._to_int(cfg.get("min_cooldown_bars", defaults.get("min_cooldown_bars", 5)), 5))
         max_hold_seconds = max(1, self._to_int(cfg.get("max_hold_seconds", defaults.get("max_hold_seconds", 14400)), 14400))
+        spread_guard_enabled = bool(cfg.get("spread_guard_enabled", defaults.get("spread_guard_enabled", True)))
+        reclaim_accel_ratio_min = max(
+            0.0,
+            self._to_float(cfg.get("reclaim_accel_ratio_min", defaults.get("reclaim_accel_ratio_min", 1.3)), 1.3),
+        )
 
         return {
             "atr_period": int(atr_period),
@@ -249,6 +254,8 @@ class LiquiditySweepReversalTickStrategy(BaseStateMachineStrategy):
             "min_hold_bars": int(min_hold_bars),
             "min_cooldown_bars": int(min_cooldown_bars),
             "max_hold_seconds": int(max_hold_seconds),
+            "spread_guard_enabled": bool(spread_guard_enabled),
+            "reclaim_accel_ratio_min": float(reclaim_accel_ratio_min),
         }
 
     @staticmethod
@@ -286,6 +293,8 @@ class LiquiditySweepReversalTickStrategy(BaseStateMachineStrategy):
         self.min_hold_bars = int(bundle["min_hold_bars"])
         self.min_cooldown_bars = int(bundle["min_cooldown_bars"])
         self.max_hold_seconds = int(bundle["max_hold_seconds"])
+        self.spread_guard_enabled = bool(bundle.get("spread_guard_enabled", True))
+        self.reclaim_accel_ratio_min = float(bundle.get("reclaim_accel_ratio_min", 1.3))
 
     def _activate_symbol_params(self, symbol: str) -> None:
         key = str(symbol or "").strip().upper()
@@ -646,24 +655,25 @@ class LiquiditySweepReversalTickStrategy(BaseStateMachineStrategy):
         now_ms, mid, _ = latest
         now_dt = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
 
-        spread_max_age_ms = int(max(2000.0, float(self.displacement_window_sec) * 5000.0))
-        spread_snapshot = self._latest_spread(symbol=symbol, now_ms=int(now_ms), max_age_ms=spread_max_age_ms)
-        if spread_snapshot is None:
-            return self._hold("SPREAD_UNAVAILABLE_SKIP", {"spread_max_age_ms": int(spread_max_age_ms)})
-        spread_used, spread_age_ms = spread_snapshot
+        if self.spread_guard_enabled:
+            spread_max_age_ms = int(max(2000.0, float(self.displacement_window_sec) * 5000.0))
+            spread_snapshot = self._latest_spread(symbol=symbol, now_ms=int(now_ms), max_age_ms=spread_max_age_ms)
+            if spread_snapshot is None:
+                return self._hold("SPREAD_UNAVAILABLE_SKIP", {"spread_max_age_ms": int(spread_max_age_ms)})
+            spread_used, spread_age_ms = spread_snapshot
 
-        spread_limit = max(0.0, float(atr) * 0.3)
-        if not math.isfinite(spread_limit):
-            return self._hold("SPREAD_GUARD_UNAVAILABLE")
-        if float(spread_used) > float(spread_limit):
-            return self._hold(
-                "HIGH_SPREAD_SKIP",
-                {
-                    "spread": float(spread_used),
-                    "spread_limit": float(spread_limit),
-                    "spread_age_ms": int(spread_age_ms),
-                },
-            )
+            spread_limit = max(0.0, float(atr) * 0.3)
+            if not math.isfinite(spread_limit):
+                return self._hold("SPREAD_GUARD_UNAVAILABLE")
+            if float(spread_used) > float(spread_limit):
+                return self._hold(
+                    "HIGH_SPREAD_SKIP",
+                    {
+                        "spread": float(spread_used),
+                        "spread_limit": float(spread_limit),
+                        "spread_age_ms": int(spread_age_ms),
+                    },
+                )
 
         # Alpha: US Session Volatility Expansion (13:00-17:00 UTC)
         # Boost sweep buffer to avoid noise during high-impact windows.
@@ -820,7 +830,8 @@ class LiquiditySweepReversalTickStrategy(BaseStateMachineStrategy):
 
             sweep_velocity = float(sweep_velocity_ctx["velocity"])
             reclaim_velocity = float(reclaim_velocity_ctx["velocity"])
-            if sweep_velocity <= 0.0 or reclaim_velocity <= 0.0:
+            accel_ratio_min = max(0.0, float(self.reclaim_accel_ratio_min))
+            if accel_ratio_min > 0.0 and (sweep_velocity <= 0.0 or reclaim_velocity <= 0.0):
                 return self._hold(
                     "RECLAIM_ACCEL_DATA_INSUFFICIENT_HOLD",
                     {
@@ -829,12 +840,12 @@ class LiquiditySweepReversalTickStrategy(BaseStateMachineStrategy):
                     },
                 )
             reclaim_accel_ratio = float(reclaim_velocity / sweep_velocity)
-            if reclaim_velocity < (1.3 * sweep_velocity):
+            if accel_ratio_min > 0.0 and reclaim_velocity < (accel_ratio_min * sweep_velocity):
                 accel_reject_meta = {
                     "sweep_velocity": float(sweep_velocity),
                     "reclaim_velocity": float(reclaim_velocity),
                     "reclaim_accel_ratio": float(reclaim_accel_ratio),
-                    "accel_ratio_min": 1.3,
+                    "accel_ratio_min": float(accel_ratio_min),
                     "sweep_velocity_ticks": int(sweep_velocity_ctx["tick_count"]),
                     "reclaim_velocity_ticks": int(reclaim_velocity_ctx["tick_count"]),
                     "sweep_price_change_abs": float(sweep_velocity_ctx["price_change_abs"]),
@@ -851,7 +862,7 @@ class LiquiditySweepReversalTickStrategy(BaseStateMachineStrategy):
                     self.name,
                     symbol,
                     float(reclaim_accel_ratio),
-                    1.3,
+                    float(accel_ratio_min),
                     float(sweep_velocity),
                     float(reclaim_velocity),
                 )
@@ -915,7 +926,7 @@ class LiquiditySweepReversalTickStrategy(BaseStateMachineStrategy):
                 "sweep_velocity": float(sweep_velocity),
                 "reclaim_velocity": float(reclaim_velocity),
                 "reclaim_accel_ratio": float(reclaim_accel_ratio),
-                "reclaim_accel_ratio_min": 1.3,
+                "reclaim_accel_ratio_min": float(accel_ratio_min),
                 "sweep_velocity_ticks": int(sweep_velocity_ctx["tick_count"]),
                 "reclaim_velocity_ticks": int(reclaim_velocity_ctx["tick_count"]),
                 "tick_time_ms": int(now_ms),

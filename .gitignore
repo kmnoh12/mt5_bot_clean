@@ -4,16 +4,26 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.venv-test/
 
 # Runtime/logs/state
 *.log
 *.tmp
+*.state.json
+*.events.jsonl
 *.bak
 *.backup
 *.old
+mt5_bot/data/
 mt5_bot/memory/daily/*.md
 mt5_bot/memory/reinforcement_log.md
 mt5_bot/runtime.lock
+mt5_bot/runtime/
+mt5_bot/runtime_control.json
+mt5_bot/state.json
+mt5_bot/events.jsonl
+mt5_bot/*state*.json
+mt5_bot/*events*.jsonl
 mt5_bot/dashboard_settings.local.json
 
 # Secrets/local config

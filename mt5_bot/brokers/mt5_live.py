@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import random
 import re
 import time
@@ -25,6 +26,8 @@ LOGGER = logging.getLogger(__name__)
 
 class MT5LiveGateway(BrokerGateway):
     mode = "live"
+    LIVE_TRADING_ENV_VAR = "MT5_ALLOW_LIVE_TRADING"
+    LIVE_TRADING_ENV_TOKEN = "YES_I_ACCEPT_RISK"
 
     @staticmethod
     def _safe_int(value: Any, default: int) -> int:
@@ -83,10 +86,13 @@ class MT5LiveGateway(BrokerGateway):
         self.config = config
         raw_mt5_cfg = config.get("mt5", {})
         raw_general_cfg = config.get("general", {})
+        raw_execution_cfg = config.get("execution", {})
         self.mt5_cfg = raw_mt5_cfg if isinstance(raw_mt5_cfg, dict) else {}
         self.general_cfg = raw_general_cfg if isinstance(raw_general_cfg, dict) else {}
+        self.execution_cfg = raw_execution_cfg if isinstance(raw_execution_cfg, dict) else {}
         self.notifier = notifier
         self._watchdog_debug_path = Path(__file__).resolve().parents[1] / "watchdog_debug.log"
+        self._refresh_order_gate_from_config()
 
         reconnect_raw = self.general_cfg.get("reconnect", {}) if isinstance(self.general_cfg, dict) else {}
         reconnect_cfg = reconnect_raw if isinstance(reconnect_raw, dict) else {}
@@ -178,6 +184,66 @@ class MT5LiveGateway(BrokerGateway):
         self._ipc_failure_count = 0
         self._ipc_threshold_reported = False
         self._api_trace: deque = deque(maxlen=80)
+
+    def _refresh_order_gate_from_config(self) -> None:
+        general_dry_run = bool(self.general_cfg.get("dry_run", True))
+        execution_dry_run = bool(self.execution_cfg.get("dry_run", False))
+        self.dry_run = bool(general_dry_run or execution_dry_run)
+        live_enabled = self.execution_cfg.get("live_trading_enabled", self.mt5_cfg.get("live_trading_enabled", False))
+        self.live_trading_enabled = bool(live_enabled)
+        self.live_trading_env_confirmed = (
+            os.environ.get(self.LIVE_TRADING_ENV_VAR) == self.LIVE_TRADING_ENV_TOKEN
+        )
+        self.orders_allowed = bool(
+            not self.dry_run
+            and self.live_trading_enabled
+            and self.live_trading_env_confirmed
+        )
+
+        if self.dry_run:
+            self.order_gate_reason = "dry_run enabled"
+        elif not self.live_trading_enabled:
+            self.order_gate_reason = "live_trading_enabled is false"
+        elif not self.live_trading_env_confirmed:
+            self.order_gate_reason = (
+                f"{self.LIVE_TRADING_ENV_VAR} must be {self.LIVE_TRADING_ENV_TOKEN}"
+            )
+        else:
+            self.order_gate_reason = ""
+
+    def update_order_gate(self, config: Dict[str, Any]) -> None:
+        self.config = config or {}
+        raw_mt5_cfg = self.config.get("mt5", {})
+        raw_general_cfg = self.config.get("general", {})
+        raw_execution_cfg = self.config.get("execution", {})
+        self.mt5_cfg = raw_mt5_cfg if isinstance(raw_mt5_cfg, dict) else {}
+        self.general_cfg = raw_general_cfg if isinstance(raw_general_cfg, dict) else {}
+        self.execution_cfg = raw_execution_cfg if isinstance(raw_execution_cfg, dict) else {}
+        self._refresh_order_gate_from_config()
+
+    def _blocked_order_result(self, operation: str, **fields: Any) -> Optional[OrderResult]:
+        if self.orders_allowed:
+            return None
+        meta = {
+            "operation": str(operation or ""),
+            "orders_allowed": False,
+            "dry_run": bool(self.dry_run),
+            "live_trading_enabled": bool(self.live_trading_enabled),
+            "env_var": self.LIVE_TRADING_ENV_VAR,
+            "env_confirmed": bool(self.live_trading_env_confirmed),
+            "reason": str(self.order_gate_reason or "live order gate closed"),
+        }
+        for key, value in fields.items():
+            try:
+                meta[str(key)] = value
+            except Exception:
+                meta[str(key)] = "<unserializable>"
+        return OrderResult(
+            ok=False,
+            status="LIVE_TRADING_BLOCKED",
+            message=f"{operation} blocked by live order gate: {meta['reason']}",
+            raw={"live_order_gate": meta},
+        )
 
     def _watchdog_debug(self, event: str, **fields: Any) -> None:
         payload = {
@@ -1013,6 +1079,9 @@ class MT5LiveGateway(BrokerGateway):
             return []
 
     def submit_order(self, intent: OrderIntent) -> OrderResult:
+        blocked = self._blocked_order_result("submit_order", symbol=intent.symbol)
+        if blocked is not None:
+            return blocked
         if not self._ensure_connected() or mt5 is None:
             return OrderResult(ok=False, status="ERROR", message="Not connected")
 
@@ -1090,6 +1159,14 @@ class MT5LiveGateway(BrokerGateway):
             return OrderResult(ok=False, status="ERROR", message=str(e))
 
     def close_position(self, position: Position, reason: str = "") -> OrderResult:
+        blocked = self._blocked_order_result(
+            "close_position",
+            symbol=position.symbol,
+            ticket=int(position.ticket),
+            reason=str(reason or ""),
+        )
+        if blocked is not None:
+            return blocked
         if not self._ensure_connected() or mt5 is None:
             return OrderResult(ok=False, status="ERROR", message="Not connected")
 
@@ -1434,6 +1511,9 @@ class MT5LiveGateway(BrokerGateway):
         )
 
     def precheck_order(self, intent: OrderIntent) -> OrderResult:
+        blocked = self._blocked_order_result("precheck_order", symbol=intent.symbol)
+        if blocked is not None:
+            return blocked
         if not self._ensure_connected() or mt5 is None:
             return OrderResult(ok=False, status="ERROR", message="Not connected")
         try:
@@ -1536,6 +1616,14 @@ class MT5LiveGateway(BrokerGateway):
         tp: Optional[float],
         reason: str,
     ) -> OrderResult:
+        blocked = self._blocked_order_result(
+            "modify_position_sl_tp",
+            symbol=position.symbol,
+            ticket=int(position.ticket),
+            reason=str(reason or ""),
+        )
+        if blocked is not None:
+            return blocked
         if not self._ensure_connected() or mt5 is None:
             return OrderResult(ok=False, status="ERROR", message="Not connected")
         try:
@@ -1598,6 +1686,9 @@ class MT5LiveGateway(BrokerGateway):
             return OrderResult(ok=False, status="ERROR", message=str(e))
 
     def close_all_positions(self, reason: str) -> List[OrderResult]:
+        blocked = self._blocked_order_result("close_all_positions", reason=str(reason or ""))
+        if blocked is not None:
+            return [blocked]
         results: List[OrderResult] = []
         positions = self.get_positions(symbol=None)
         for p in positions:

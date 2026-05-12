@@ -5,14 +5,19 @@ import math
 import shutil
 import subprocess
 import argparse
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
 import yaml
 
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from core.performance_metrics import compute_backtest_metrics
+
 RUN_ROOT = ROOT / "pipeline_runs"
 BASE_CONFIG = ROOT / "config.yaml"
 DATA_DIR = ROOT / "data" / "aggressive_20260106_20260206"
@@ -44,7 +49,7 @@ def save_yaml(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def compute_metrics(events_path: Path) -> Dict[str, Any]:
-    trades: List[float] = []
+    trades: List[Dict[str, Any]] = []
     if not events_path.exists():
         return {"trades": 0}
     with events_path.open("r", encoding="utf-8") as f:
@@ -58,49 +63,26 @@ def compute_metrics(events_path: Path) -> Dict[str, Any]:
                 continue
             if row.get("event") != "trade_ledger":
                 continue
-            pnl = row.get("realized_pnl")
-            try:
-                pnl_f = float(pnl)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(pnl_f):
-                trades.append(pnl_f)
+            trades.append(row)
 
     if not trades:
         return {"trades": 0}
 
-    wins = [x for x in trades if x > 0]
-    losses = [x for x in trades if x < 0]
-    gross_profit = sum(wins)
-    gross_loss = -sum(losses)
-    pf = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
-    win_rate = len(wins) / len(trades)
-    avg_pnl = sum(trades) / len(trades)
-
-    equity = 0.0
-    peak = 0.0
-    max_dd = 0.0
-    max_consecutive_loss = 0
-    cur_consecutive_loss = 0
-    for t in trades:
-        equity += t
-        peak = max(peak, equity)
-        dd = peak - equity
-        max_dd = max(max_dd, dd)
-        if t < 0:
-            cur_consecutive_loss += 1
-            max_consecutive_loss = max(max_consecutive_loss, cur_consecutive_loss)
-        else:
-            cur_consecutive_loss = 0
-
+    metrics = compute_backtest_metrics(trades)
+    pf = metrics.get("profit_factor", 0.0)
     return {
-        "trades": len(trades),
-        "net_pnl": round(sum(trades), 4),
-        "win_rate": round(win_rate, 4),
-        "profit_factor": ("inf" if math.isinf(pf) else round(pf, 4)),
-        "avg_pnl": round(avg_pnl, 4),
-        "max_drawdown_abs": round(max_dd, 4),
-        "max_consecutive_loss": int(max_consecutive_loss),
+        "trades": int(metrics["trades"]),
+        "net_pnl": round(float(metrics["net_pnl"]), 4),
+        "win_rate": round(float(metrics["win_rate"]), 4),
+        "avg_win": round(float(metrics["avg_win"]), 4),
+        "avg_loss": round(float(metrics["avg_loss"]), 4),
+        "expectancy": round(float(metrics["expectancy"]), 4),
+        "profit_factor": ("inf" if isinstance(pf, float) and math.isinf(pf) else round(float(pf), 4)),
+        "max_drawdown_abs": round(float(metrics["max_drawdown"]), 4),
+        "fees_cost_estimate": round(float(metrics["fees_cost_estimate"]), 4),
+        "exposure_seconds": round(float(metrics["exposure_seconds"]), 4),
+        "quick_exit_count": int(metrics["quick_exit_count"]),
+        "churn_count": int(metrics["churn_count"]),
     }
 
 

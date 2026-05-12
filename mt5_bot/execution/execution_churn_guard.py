@@ -124,7 +124,7 @@ class ExecutionChurnGuard:
                 if not key:
                     continue
                 try:
-                    parsed[key] = max(1, int(value))
+                    parsed[key] = max(0, int(value))
                 except (TypeError, ValueError):
                     continue
         # Compatibility key requested by user.

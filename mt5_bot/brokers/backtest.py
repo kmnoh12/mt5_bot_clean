@@ -11,7 +11,6 @@ import pandas as pd
 
 from brokers.base import BrokerGateway
 from core.models import OrderIntent, OrderResult, Position, Side, SymbolConstraints
-from data.historical_loader import HistoricalDataLoader
 
 
 LOGGER = logging.getLogger(__name__)
@@ -21,6 +20,65 @@ LOGGER = logging.getLogger(__name__)
 class InstrumentKey:
     symbol: str
     timeframe: str
+
+
+class HistoricalDataLoader:
+    REQUIRED_COLUMNS = {"open", "high", "low", "close"}
+
+    def __init__(self, data_dir: Path) -> None:
+        self.data_dir = Path(data_dir)
+
+    def _candidate_paths(self, symbol: str, timeframe: str) -> List[Path]:
+        filenames = [
+            f"{symbol}_{timeframe}.csv",
+            f"{str(symbol).upper()}_{str(timeframe).upper()}.csv",
+            f"{symbol}.csv",
+            f"{str(symbol).upper()}.csv",
+        ]
+        candidates = [self.data_dir / name for name in filenames]
+        if self.data_dir.exists():
+            wanted = {name.lower() for name in filenames}
+            for path in self.data_dir.glob("*.csv"):
+                if path.name.lower() in wanted and path not in candidates:
+                    candidates.append(path)
+        return candidates
+
+    def load(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
+        for path in self._candidate_paths(symbol=symbol, timeframe=timeframe):
+            if not path.exists() or not path.is_file():
+                continue
+            try:
+                frame = pd.read_csv(path)
+            except Exception as exc:
+                LOGGER.warning("Failed to read backtest CSV %s: %s", path, exc)
+                continue
+            if frame is None or frame.empty:
+                continue
+
+            normalized_columns = {str(col).strip(): str(col).strip().lower() for col in frame.columns}
+            frame = frame.rename(columns=normalized_columns)
+            missing = self.REQUIRED_COLUMNS - set(frame.columns)
+            if missing:
+                LOGGER.warning("Backtest CSV %s missing columns: %s", path, sorted(missing))
+                continue
+
+            for column in ["open", "high", "low", "close", "tick_volume", "volume"]:
+                if column in frame.columns:
+                    frame[column] = pd.to_numeric(frame[column], errors="coerce")
+            frame = frame.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+            if frame.empty:
+                continue
+
+            time_column = "time" if "time" in frame.columns else "timestamp" if "timestamp" in frame.columns else ""
+            if time_column:
+                numeric_time = pd.to_numeric(frame[time_column], errors="coerce")
+                if numeric_time.notna().all():
+                    frame[time_column] = pd.to_datetime(numeric_time, unit="s", utc=True, errors="coerce")
+                else:
+                    frame[time_column] = pd.to_datetime(frame[time_column], utc=True, errors="coerce")
+                frame = frame.sort_values(time_column).reset_index(drop=True)
+            return frame
+        return None
 
 
 class BacktestGateway(BrokerGateway):

@@ -1222,7 +1222,13 @@ class RiskEngine:
                 )
 
             side_text = str(side or "").strip().lower()
-            if self.dynamic_lot_enabled and sl is not None and side_text in {"buy", "sell"} and str(symbol or "").strip():
+            if (
+                self.dynamic_lot_enabled
+                and mt5 is not None
+                and sl is not None
+                and side_text in {"buy", "sell"}
+                and str(symbol or "").strip()
+            ):
                 dynamic_default_lot = req if req is not None and req > 0 else self.dynamic_lot_default_lot
                 dynamic_lot = self.calculate_dynamic_lot(
                     symbol=str(symbol or ""),

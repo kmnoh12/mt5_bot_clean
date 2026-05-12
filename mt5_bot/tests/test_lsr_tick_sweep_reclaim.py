@@ -54,6 +54,8 @@ class LsrTickSweepReclaimTests(unittest.TestCase):
                 "tick_buffer_seconds": 60,
                 "min_hold_bars": 1,
                 "min_cooldown_bars": 1,
+                "spread_guard_enabled": False,
+                "reclaim_accel_ratio_min": 0.0,
             }
         )
 
@@ -98,6 +100,8 @@ class LsrTickSweepReclaimTests(unittest.TestCase):
                 "displacement_window_sec": 1.0,
                 "displacement_lookback_sec": 12.0,
                 "tick_buffer_seconds": 120,
+                "spread_guard_enabled": False,
+                "reclaim_accel_ratio_min": 0.0,
             }
         )
 
@@ -127,6 +131,8 @@ class LsrTickSweepReclaimTests(unittest.TestCase):
                 "displacement_window_sec": 1.0,
                 "displacement_lookback_sec": 12.0,
                 "tick_buffer_seconds": 120,
+                "spread_guard_enabled": False,
+                "reclaim_accel_ratio_min": 0.0,
             }
         )
 
