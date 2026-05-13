@@ -63,6 +63,74 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "close_positions_on_exit": True,
         "bar_close_only": True,
     },
+    "execution_style": {
+        "name": "fee_aware_fixed_risk_profit_lock",
+        "long_enabled": True,
+        "short_enabled": True,
+        "objective": "Find high-quality long/short entries, cap net loss per trade, lock profit aggressively.",
+    },
+    "risk_per_trade": {
+        "target_net_loss_usd": 1.0,
+        "hard_max_net_loss_usd": 1.25,
+        "spread_points": 0.0,
+        "commission_per_lot": 0.0,
+        "expected_slippage_points": 0.0,
+    },
+    "entry_quality": {
+        "min_reward_to_net_risk_ratio": 3.0,
+        "min_signal_score": 70,
+        "forbid_late_entry": True,
+        "require_deterministic_signal": True,
+        "allow_llm_discretionary_entry": False,
+        "allow_llm_discretionary_veto": False,
+    },
+    "initial_exit": {
+        "take_profit": {
+            "min_profit_usd": 3.0,
+            "preferred_profit_usd": 5.0,
+            "allow_tp_extension": True,
+        },
+    },
+    "profit_lock": {
+        "enabled": True,
+        "evaluate_on_tick": True,
+        "use_net_unrealized_pnl_after_estimated_exit_costs": True,
+        "never_move_sl_backward": True,
+        "min_seconds_between_sltp_updates": 10,
+    },
+    "daily_bleed_guard": {
+        "enabled": True,
+        "max_daily_net_loss_usd": 3.0,
+        "stop_after_consecutive_losses": 3,
+        "cooldown_after_loss_minutes": 30,
+        "cooldown_after_same_setup_loss_minutes": 60,
+        "same_direction_loss_limit_per_day": 2,
+        "same_symbol_loss_limit_per_day": 3,
+    },
+    "opportunity_scanner": {
+        "enabled": True,
+        "drive_entries": True,
+        "lookback_bars": 20,
+        "atr_period": 14,
+        "sweep_buffer_atr": 0.05,
+        "stop_buffer_atr": 0.05,
+        "late_entry_atr_mult": 0.75,
+        "late_entry_min_rr": 1.0,
+    },
+    "fee_aware_entry_filter": {
+        "enabled": True,
+        "max_signal_age_seconds": 300,
+    },
+    "no_trade_bias_guard": {
+        "enabled": True,
+        "warning_no_trade_hours": 24.0,
+        "failure_no_trade_hours": 48.0,
+        "top_rejected_limit": 5,
+    },
+    "reports": {
+        "enabled": True,
+        "output_dir": "reports",
+    },
     "risk_guard": {
         "risk_per_trade_pct": 0.003,
         "max_risk_per_trade_pct": 0.005,
@@ -112,7 +180,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_entries_per_symbol_per_hour": 2,
         "max_entries_per_symbol_per_day": 3,
         "max_entries_per_symbol_per_day_eth": 0,
-        "max_entries_global_per_day": 3,
+        "max_entries_global_per_day": 1,
         "daily_reset_timezone": "Asia/Seoul",
         "per_symbol_daily_limits": {"BTCUSD": 1, "ETHUSD": 0, "GOLD": 0},
         "min_hold_bars_floor": 2,
@@ -126,7 +194,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "entry_quality_guard": {
         "enabled": True,
-        "trend_only_symbols": ["BTCUSD", "ETHUSD"],
+        "trend_only_symbols": ["BTCUSD"],
         "min_score": 0.62,
         "min_score_risk_off": 0.68,
         "min_score_risk_on": 0.58,
@@ -156,7 +224,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "mtf_confirm": {
         "enabled": True,
-        "symbols": ["BTCUSD", "ETHUSD"],
+        "symbols": ["BTCUSD"],
         "confirm_timeframe": "TIMEFRAME_M5",
         "fast_ema": 20,
         "slow_ema": 50,
@@ -213,7 +281,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "auto_tuning": {
         "enabled": False,
-        "target_symbols": ["BTCUSD", "ETHUSD"],
+        "target_symbols": ["BTCUSD"],
         "tune_interval_seconds": 300,
         "lookback_bars": 120,
         "min_bars": 80,
@@ -238,8 +306,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "state_path": "./state.json",
         "events_path": "./events.jsonl",
     },
-    "required_active_symbols": ["BTCUSD", "ETHUSD", "TSLA", "NVDA", "LUNR", "GOLD"],
-    "nasdaq_universe": ["TSLA", "NVDA", "LUNR"],
+    "required_active_symbols": ["BTCUSD"],
+    "nasdaq_universe": ["BTCUSD"],
     "symbol_profiles": {},
     "universe": [
         {
@@ -248,36 +316,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "timeframe": "TIMEFRAME_M1",
             "volume": 0.01,
         },
-        {
-            "symbol": "ETHUSD",
-            "strategy": "trend_regime_sm",
-            "timeframe": "TIMEFRAME_M1",
-            "volume": 0.01,
-        },
-        {
-            "symbol": "TSLA",
-            "strategy": "trend_regime_sm",
-            "timeframe": "TIMEFRAME_M1",
-            "volume": 0.01,
-        },
-        {
-            "symbol": "NVDA",
-            "strategy": "trend_regime_sm",
-            "timeframe": "TIMEFRAME_M1",
-            "volume": 0.01,
-        },
-        {
-            "symbol": "LUNR",
-            "strategy": "trend_regime_sm",
-            "timeframe": "TIMEFRAME_M1",
-            "volume": 0.01,
-        },
-        {
-            "symbol": "GOLD",
-            "strategy": "trend_regime_sm",
-            "timeframe": "TIMEFRAME_M1",
-            "volume": 0.01,
-        },
+
     ],
     "strategies": {
         "mean_reversion_sm": {

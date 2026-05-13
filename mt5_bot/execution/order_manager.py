@@ -11,6 +11,9 @@ from typing import Any, Dict, Optional
 
 from brokers.base import BrokerGateway
 from core.models import DecisionAction, OrderIntent, OrderResult, Position, Side, StrategyDecision, SymbolConstraints
+from core.risk_model import FeeAwareRiskInput, FeeAwareRiskModel
+from execution.exit_planner import InitialExitPlanner
+from execution.position_sizer import NetRiskPositionSizer, NetRiskPositionSizeInput, SymbolVolumeSpec
 from execution.risk_manager import RiskEngine
 from storage.json_store import JsonStore
 
@@ -39,6 +42,10 @@ class OrderManager:
         self.allow_opposite_position = bool(self.execution_cfg.get("allow_opposite_position", False))
         self.default_volume = max(0.001, float(self.execution_cfg.get("default_volume", 0.01)))
         self.max_positions_per_symbol = max(1, int(self.execution_cfg.get("max_positions_per_symbol", 1)))
+        self.fee_aware_risk_model = FeeAwareRiskModel()
+        self.net_risk_position_sizer = NetRiskPositionSizer(self.fee_aware_risk_model)
+        self.initial_exit_planner = InitialExitPlanner()
+        self.daily_bleed_guard = None
         self.on_position_closed = None
         self._last_trade_event_ticket: Optional[int] = None
         self._last_trade_event_type: Optional[str] = None
@@ -560,10 +567,176 @@ class OrderManager:
         )
         return result
 
-    def _guard_open_permission(self) -> Optional[str]:
+    def _guard_open_permission(
+        self,
+        symbol: Optional[str] = None,
+        direction: Optional[str] = None,
+        setup_key: Optional[str] = None,
+    ) -> Optional[str]:
         account = self.broker.account_info()
         allowed, reason = self.risk_engine.can_trade(account)
-        return None if allowed else reason
+        if not allowed:
+            return reason
+        guard = getattr(self, "daily_bleed_guard", None)
+        if guard is not None:
+            block = guard.should_block_entry(
+                symbol=str(symbol or ""),
+                now_ts=time.time(),
+                direction=direction,
+                setup_key=setup_key,
+            )
+            if block:
+                return block
+        return None
+
+    def _fee_aware_fixed_risk_config(self) -> Optional[Dict[str, Any]]:
+        cfg = self.execution_cfg.get("fee_aware_fixed_risk")
+        if not isinstance(cfg, dict):
+            return None
+        if not bool(cfg.get("enabled", False)):
+            return None
+        return cfg
+
+    @staticmethod
+    def _constraint_tick_size(constraints: SymbolConstraints) -> float:
+        point = float(getattr(constraints, "point", 0.0) or 0.0)
+        return point if point > 0 else 0.0001
+
+    @classmethod
+    def _constraint_tick_value(cls, constraints: SymbolConstraints, cfg: Dict[str, Any]) -> float:
+        configured = cls._finite_float(cfg.get("tick_value"))
+        if configured is not None and configured > 0:
+            return configured
+        tick_size = cls._constraint_tick_size(constraints)
+        contract_size = float(getattr(constraints, "contract_size", 1.0) or 1.0)
+        return max(1e-12, tick_size * contract_size)
+
+    def _fee_aware_cost_values(self, decision: StrategyDecision, constraints: SymbolConstraints, cfg: Dict[str, Any]) -> Dict[str, float]:
+        metadata = decision.metadata if isinstance(decision.metadata, dict) else {}
+        spread = self._finite_float(metadata.get("spread"))
+        if spread is None:
+            spread_points = self._finite_float(metadata.get("spread_points"))
+            if spread_points is None:
+                spread_points = self._finite_float(cfg.get("spread_points"))
+            spread = (spread_points or 0.0) * self._constraint_tick_size(constraints)
+        commission = self._finite_float(metadata.get("commission_per_lot"))
+        if commission is None:
+            commission = self._finite_float(cfg.get("commission_per_lot")) or 0.0
+        slippage_points = self._finite_float(metadata.get("expected_slippage_points"))
+        if slippage_points is None:
+            slippage_points = self._finite_float(cfg.get("expected_slippage_points")) or 0.0
+        return {
+            "spread": max(0.0, float(spread or 0.0)),
+            "commission_per_lot": max(0.0, float(commission or 0.0)),
+            "expected_slippage_points": max(0.0, float(slippage_points or 0.0)),
+        }
+
+    def _fee_aware_size_and_plan_entry(
+        self,
+        *,
+        symbol: str,
+        side: Side,
+        decision: StrategyDecision,
+        constraints: SymbolConstraints,
+        entry_price: Optional[float],
+        cfg: Dict[str, Any],
+    ) -> tuple[Optional[float], Optional[str], Dict[str, Any], Optional[float], Optional[float]]:
+        entry = self._finite_float(entry_price)
+        sl = self._finite_float(decision.sl)
+        if entry is None or sl is None:
+            return None, "FEE_AWARE_INVALID_ENTRY_OR_SL", {}, decision.sl, decision.tp
+        direction = "long" if side == Side.BUY else "short"
+        target_loss = self._finite_float(cfg.get("target_net_loss_usd")) or 1.0
+        hard_max = self._finite_float(cfg.get("hard_max_net_loss_usd")) or 1.25
+        costs = self._fee_aware_cost_values(decision, constraints, cfg)
+        tick_size = self._constraint_tick_size(constraints)
+        tick_value = self._constraint_tick_value(constraints, cfg)
+        contract_size = float(getattr(constraints, "contract_size", 1.0) or 1.0)
+        spec = SymbolVolumeSpec(
+            volume_min=float(getattr(constraints, "min_volume", 0.01) or 0.01),
+            volume_step=float(getattr(constraints, "volume_step", 0.01) or 0.01),
+            volume_max=float(getattr(constraints, "max_volume", 100.0) or 100.0),
+            tick_size=tick_size,
+            tick_value=tick_value,
+            contract_size=contract_size,
+        )
+        try:
+            size_result = self.net_risk_position_sizer.size(
+                NetRiskPositionSizeInput(
+                    symbol=symbol,
+                    target_net_loss_usd=target_loss,
+                    hard_max_net_loss_usd=hard_max,
+                    entry_price=entry,
+                    stop_price=sl,
+                    direction=direction,
+                    symbol_spec=spec,
+                    spread=costs["spread"],
+                    commission_per_lot=costs["commission_per_lot"],
+                    expected_slippage_points=costs["expected_slippage_points"],
+                )
+            )
+        except Exception as exc:
+            return None, f"FEE_AWARE_SIZE_ERROR:{exc}", {}, decision.sl, decision.tp
+        if not size_result.passed or size_result.recommended_lot is None:
+            meta = {
+                "fee_aware": True,
+                "failure_reason": size_result.failure_reason,
+                "estimated_net_loss": size_result.estimated_net_loss,
+            }
+            return None, str(size_result.failure_reason or "FEE_AWARE_SIZE_FAILED"), meta, decision.sl, decision.tp
+        lot = float(size_result.recommended_lot)
+        risk_result = self.fee_aware_risk_model.estimate(
+            FeeAwareRiskInput(
+                symbol=symbol,
+                entry_price=entry,
+                stop_price=sl,
+                direction=direction,
+                lot=lot,
+                spread=costs["spread"],
+                commission_per_lot=costs["commission_per_lot"],
+                expected_slippage_points=costs["expected_slippage_points"],
+                tick_size=tick_size,
+                tick_value=tick_value,
+                contract_size=contract_size,
+                take_profit_price=self._finite_float(decision.tp),
+                target_net_loss_usd=target_loss,
+                hard_max_net_loss_usd=hard_max,
+            )
+        )
+        min_rr = self._finite_float(cfg.get("min_reward_to_net_risk_ratio")) or 3.0
+        min_tp_profit = self._finite_float(cfg.get("min_tp_net_profit_usd")) or 3.0
+        preferred_tp_profit = self._finite_float(cfg.get("preferred_tp_net_profit_usd")) or 5.0
+        target_reference = self._finite_float(decision.metadata.get("target_reference_price")) if isinstance(decision.metadata, dict) else None
+        if target_reference is None:
+            target_reference = self._finite_float(decision.tp)
+        plan = self.initial_exit_planner.plan(
+            direction=side.value,
+            entry_price=entry,
+            invalidation_price=sl,
+            target_reference_price=target_reference,
+            position_size=lot,
+            contract_size=contract_size,
+            estimated_round_trip_cost=risk_result.estimated_cost_usd,
+            min_reward_to_net_risk_ratio=min_rr,
+            hard_max_loss=hard_max,
+            min_tp_net_profit=min_tp_profit,
+            preferred_tp_net_profit=preferred_tp_profit,
+            symbol_spec=constraints,
+        )
+        if not plan.passed:
+            return None, f"INITIAL_EXIT_PLAN_FAILED:{plan.reason}", {"fee_aware": True, "exit_plan": plan.__dict__}, decision.sl, decision.tp
+        meta = {
+            "fee_aware": True,
+            "volume_source": "fee_aware_fixed_risk",
+            "expected_pnl_usd": -float(plan.expected_net_loss_at_sl),
+            "estimated_net_loss": float(plan.expected_net_loss_at_sl),
+            "estimated_net_profit_at_tp": float(plan.expected_net_profit_at_tp),
+            "fee_adjusted_rr": float(plan.fee_adjusted_rr),
+            "target_net_loss_usd": float(target_loss),
+            "hard_max_net_loss_usd": float(hard_max),
+            "risk_model": risk_result.__dict__,
+        }
+        return lot, None, meta, plan.sl_price, plan.tp_price
 
     def process_decision(
         self,
@@ -735,7 +908,15 @@ class OrderManager:
         if decision.action not in {DecisionAction.BUY, DecisionAction.SELL}:
             return None
 
-        block_reason = self._guard_open_permission()
+        side = Side.BUY if decision.action == DecisionAction.BUY else Side.SELL
+        setup_key = None
+        if isinstance(decision.metadata, dict):
+            setup_key = decision.metadata.get("setup_key") or decision.metadata.get("setup") or decision.reason
+        block_reason = self._guard_open_permission(
+            symbol=symbol,
+            direction=side.value,
+            setup_key=str(setup_key or "") or None,
+        )
         if block_reason is not None:
             self.store.append_event(
                 {
@@ -840,7 +1021,6 @@ class OrderManager:
             )
             return None
 
-        side = Side.BUY if decision.action == DecisionAction.BUY else Side.SELL
         constraints = self.broker.get_symbol_constraints(symbol)
         if constraints is None:
             constraints = SymbolConstraints()
@@ -871,21 +1051,36 @@ class OrderManager:
         payoff_ratio = self._finite_float(decision.metadata.get("payoff_ratio"))
         if payoff_ratio is None:
             payoff_ratio = self._finite_float(decision.metadata.get("expected_rr"))
-        volume, volume_err, plan_meta = self.risk_engine.plan_entry_volume(
-            constraints=constraints,
-            equity=equity,
-            entry_price=signal_price,
-            sl_price=decision.sl,
-            requested_volume=requested_volume,
-            side=side.value,
-            volume_scale=volume_scale,
-            quote_to_account_rate=quote_to_account_rate,
-            require_fx_rate=require_fx_rate,
-            win_probability=win_probability,
-            payoff_ratio=payoff_ratio,
-            symbol=symbol,
-        )
-        if volume is None and str(volume_err or "") == "MIN_VOLUME_EXCEEDS_RISK_LIMIT":
+        fee_aware_cfg = self._fee_aware_fixed_risk_config()
+        if fee_aware_cfg is not None:
+            volume, volume_err, plan_meta, planned_sl, planned_tp = self._fee_aware_size_and_plan_entry(
+                symbol=symbol,
+                side=side,
+                decision=decision,
+                constraints=constraints,
+                entry_price=signal_price,
+                cfg=fee_aware_cfg,
+            )
+            if planned_sl is not None:
+                decision.sl = planned_sl
+            if planned_tp is not None:
+                decision.tp = planned_tp
+        else:
+            volume, volume_err, plan_meta = self.risk_engine.plan_entry_volume(
+                constraints=constraints,
+                equity=equity,
+                entry_price=signal_price,
+                sl_price=decision.sl,
+                requested_volume=requested_volume,
+                side=side.value,
+                volume_scale=volume_scale,
+                quote_to_account_rate=quote_to_account_rate,
+                require_fx_rate=require_fx_rate,
+                win_probability=win_probability,
+                payoff_ratio=payoff_ratio,
+                symbol=symbol,
+            )
+        if fee_aware_cfg is None and volume is None and str(volume_err or "") == "MIN_VOLUME_EXCEEDS_RISK_LIMIT":
             can_retry_with_auto_volume = False
             if isinstance(plan_meta, dict):
                 risk_amount = self._finite_float(plan_meta.get("risk_amount"))

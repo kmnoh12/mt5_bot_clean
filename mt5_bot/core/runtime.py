@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import logging
@@ -24,7 +24,9 @@ from core.control import (
 )
 from core.lifecycle import LifecycleController
 from core.models import BotMode, DecisionAction, OrderResult, Position, Side, StrategyDecision, StrategyEvaluationContext, StrategyState
+from core.no_trade_guard import NoTradeBiasGuard
 from core.validation import check_live_readiness
+from execution.daily_bleed_guard import DailyBleedGuard
 from execution.execution_churn_guard import ExecutionChurnGuard
 from execution.cost_edge_guard import CostEdgeGuard
 from execution.entry_quality_guard import EntryQualityGuard
@@ -34,11 +36,16 @@ from execution.exit_retry_guard import ExitRetryGuard
 from execution.manual_position_guard import ManualPositionGuard
 from execution.mtf_confirm import MtfDirectionConfirm
 from execution.order_manager import OrderManager
+from execution.profit_lock import ProfitLockTrailingManager
 from execution.risk_manager import RiskEngine
 from execution.trade_journal import TradeJournal
+from reports.active_opportunities import write_active_opportunity_reports
+from reports.no_trade_report import build_no_trade_report_json, build_no_trade_report_markdown
 from execution.trailing_guard import DynamicTrailingProfitGuard
 from storage.json_store import JsonStore
+from strategies.entry_filter import FeeAwareEntryFilter
 from strategies.factory import build_strategies
+from strategies.opportunity_scanner import TradeOpportunityScanner
 from utils.liquidity import find_daily_levels
 
 
@@ -100,6 +107,26 @@ class TradingRuntime:
             if isinstance(self.state.get("trailing_profit_guard"), dict)
             else {},
         )
+        profit_lock_cfg = self.config.get("profit_lock", {}) if isinstance(self.config.get("profit_lock", {}), dict) else {}
+        self.v4_profit_lock_enabled = bool(profit_lock_cfg.get("enabled", False))
+        self.v4_profit_lock = ProfitLockTrailingManager(
+            min_seconds_between_sltp_updates=float(profit_lock_cfg.get("min_seconds_between_sltp_updates", 10.0) or 10.0)
+        )
+        self.daily_bleed_guard = DailyBleedGuard(
+            config=self.config.get("daily_bleed_guard", {}),
+            snapshot=dict(self.state.get("daily_bleed_guard", {}))
+            if isinstance(self.state.get("daily_bleed_guard"), dict)
+            else {},
+        )
+        self.trade_opportunity_scanner = TradeOpportunityScanner(**self._trade_opportunity_scanner_config())
+        self.fee_aware_entry_filter = FeeAwareEntryFilter(self._fee_aware_entry_filter_config())
+        self.no_trade_guard = NoTradeBiasGuard(
+            config=self.config.get("no_trade_bias_guard", {}),
+            snapshot=dict(self.state.get("no_trade_bias_guard", {}))
+            if isinstance(self.state.get("no_trade_bias_guard"), dict)
+            else {},
+        )
+        self._active_opportunity_candidates: list[Dict[str, Any]] = []
         self.manual_position_guard = ManualPositionGuard(
             config=self.config.get("manual_position_guard", {}),
             snapshot=dict(self.state.get("manual_position_guard", {}))
@@ -137,11 +164,12 @@ class TradingRuntime:
             broker=self.broker,
             store=self.store,
             notifier=self.notifier,
-            execution_cfg=self.config.get("execution", {}),
+            execution_cfg=self._order_manager_execution_config(),
             risk_engine=self.risk_engine,
             dry_run=self.dry_run,
         )
         self.order_manager.on_position_closed = self._on_position_closed
+        self.order_manager.daily_bleed_guard = self.daily_bleed_guard
         self._sync_order_manager_execution_config()
 
         # strategies
@@ -157,6 +185,9 @@ class TradingRuntime:
             self._apply_runtime_overrides(self.auto_tuning.overrides, context="startup:snapshot_restore")
         self.state["auto_tuning"] = self.auto_tuning.snapshot()
         self.state["trailing_profit_guard"] = self.trailing_guard.snapshot()
+        self.state["daily_bleed_guard"] = self.daily_bleed_guard.snapshot()
+        if hasattr(self, "no_trade_guard"):
+            self.state["no_trade_bias_guard"] = self.no_trade_guard.snapshot()
         self.state["manual_position_guard"] = self.manual_position_guard.snapshot()
         self.state["execution_churn_guard"] = self.execution_churn_guard.snapshot()
         self.state["entry_quality_guard"] = self.entry_quality_guard.snapshot()
@@ -482,8 +513,30 @@ class TradingRuntime:
                     blocked_symbols.discard(symbol)
         return blocked_symbols
 
-    def _sync_order_manager_execution_config(self) -> None:
+    def _order_manager_execution_config(self) -> Dict[str, Any]:
         execution_cfg = dict(self.config.get("execution", {}) or {})
+        style_cfg = self.config.get("execution_style", {}) if isinstance(self.config.get("execution_style", {}), dict) else {}
+        risk_cfg = self.config.get("risk_per_trade", {}) if isinstance(self.config.get("risk_per_trade", {}), dict) else {}
+        entry_cfg = self.config.get("entry_quality", {}) if isinstance(self.config.get("entry_quality", {}), dict) else {}
+        exit_cfg = self.config.get("initial_exit", {}) if isinstance(self.config.get("initial_exit", {}), dict) else {}
+        fee_cfg = dict(execution_cfg.get("fee_aware_fixed_risk", {}) or {})
+        enabled_by_style = str(style_cfg.get("name", "")).strip() == "fee_aware_fixed_risk_profit_lock"
+        if enabled_by_style or risk_cfg:
+            fee_cfg["enabled"] = bool(fee_cfg.get("enabled", enabled_by_style or risk_cfg.get("enabled", True)))
+            fee_cfg.setdefault("target_net_loss_usd", risk_cfg.get("target_net_loss_usd", 1.0))
+            fee_cfg.setdefault("hard_max_net_loss_usd", risk_cfg.get("hard_max_net_loss_usd", 1.25))
+            fee_cfg.setdefault("commission_per_lot", risk_cfg.get("commission_per_lot", 0.0))
+            fee_cfg.setdefault("spread_points", risk_cfg.get("spread_points", 0.0))
+            fee_cfg.setdefault("expected_slippage_points", risk_cfg.get("expected_slippage_points", 0.0))
+            fee_cfg.setdefault("min_reward_to_net_risk_ratio", entry_cfg.get("min_reward_to_net_risk_ratio", 3.0))
+            tp_cfg = exit_cfg.get("take_profit", {}) if isinstance(exit_cfg.get("take_profit", {}), dict) else {}
+            fee_cfg.setdefault("min_tp_net_profit_usd", tp_cfg.get("min_profit_usd", 3.0))
+            fee_cfg.setdefault("preferred_tp_net_profit_usd", tp_cfg.get("preferred_profit_usd", 5.0))
+            execution_cfg["fee_aware_fixed_risk"] = fee_cfg
+        return execution_cfg
+
+    def _sync_order_manager_execution_config(self) -> None:
+        execution_cfg = self._order_manager_execution_config()
         self.order_manager.execution_cfg = execution_cfg
         self.order_manager.comment_prefix = str(
             execution_cfg.get("comment_prefix", self.order_manager.comment_prefix or "quant_bot")
@@ -694,6 +747,225 @@ class TradingRuntime:
             return None
         return out
 
+    def _trade_opportunity_scanner_config(self) -> Dict[str, Any]:
+        scanner_cfg = self.config.get("opportunity_scanner", {})
+        if not isinstance(scanner_cfg, dict):
+            scanner_cfg = {}
+        entry_quality = self.config.get("entry_quality", {}) if isinstance(self.config.get("entry_quality", {}), dict) else {}
+        risk_cfg = self.config.get("risk_per_trade", {}) if isinstance(self.config.get("risk_per_trade", {}), dict) else {}
+        return {
+            "lookback_bars": int(scanner_cfg.get("lookback_bars", 20) or 20),
+            "atr_period": int(scanner_cfg.get("atr_period", 14) or 14),
+            "min_signal_score": float(scanner_cfg.get("min_signal_score", entry_quality.get("min_signal_score", 70.0)) or 70.0),
+            "sweep_buffer_atr": float(scanner_cfg.get("sweep_buffer_atr", 0.05) or 0.05),
+            "stop_buffer_atr": float(scanner_cfg.get("stop_buffer_atr", 0.05) or 0.05),
+            "min_atr": float(scanner_cfg.get("min_atr", 0.0) or 0.0),
+            "late_entry_atr_mult": float(scanner_cfg.get("late_entry_atr_mult", 0.75) or 0.75),
+            "late_entry_min_rr": float(scanner_cfg.get("late_entry_min_rr", 1.0) or 1.0),
+            "round_turn_cost": float(scanner_cfg.get("round_turn_cost", risk_cfg.get("round_turn_cost", 0.0)) or 0.0),
+        }
+
+    def _opportunity_scanner_enabled(self) -> bool:
+        scanner_cfg = self.config.get("opportunity_scanner", {})
+        if isinstance(scanner_cfg, dict) and "enabled" in scanner_cfg:
+            return bool(scanner_cfg.get("enabled"))
+        style = self.config.get("execution_style", {}) if isinstance(self.config.get("execution_style", {}), dict) else {}
+        return str(style.get("name", "")).strip() == "fee_aware_fixed_risk_profit_lock"
+
+    def _opportunity_scanner_drives_entries(self) -> bool:
+        scanner_cfg = self.config.get("opportunity_scanner", {})
+        if not isinstance(scanner_cfg, dict):
+            return True
+        return bool(scanner_cfg.get("drive_entries", True))
+
+    def _fee_aware_entry_filter_config(self) -> Dict[str, Any]:
+        entry_quality = self.config.get("entry_quality", {}) if isinstance(self.config.get("entry_quality", {}), dict) else {}
+        risk_cfg = self.config.get("risk_per_trade", {}) if isinstance(self.config.get("risk_per_trade", {}), dict) else {}
+        position_limits = self.config.get("position_limits", {}) if isinstance(self.config.get("position_limits", {}), dict) else {}
+        execution_cfg = self.config.get("execution", {}) if isinstance(self.config.get("execution", {}), dict) else {}
+        filter_cfg = self.config.get("fee_aware_entry_filter", {}) if isinstance(self.config.get("fee_aware_entry_filter", {}), dict) else {}
+        merged = dict(filter_cfg)
+        merged.setdefault("enabled", True)
+        merged.setdefault("min_signal_score", entry_quality.get("min_signal_score", 70.0))
+        merged.setdefault("min_reward_to_net_risk_ratio", entry_quality.get("min_reward_to_net_risk_ratio", 3.0))
+        merged.setdefault("hard_max_net_loss_usd", risk_cfg.get("hard_max_net_loss_usd", 1.25))
+        merged.setdefault("max_spread_points", execution_cfg.get("max_spread", risk_cfg.get("max_spread_points", 60.0)))
+        merged.setdefault("max_open_positions", position_limits.get("max_open_positions_total", 1))
+        return merged
+
+    def _refresh_v4_opportunity_runtime_stack(self) -> None:
+        self.trade_opportunity_scanner = TradeOpportunityScanner(**self._trade_opportunity_scanner_config())
+        self.fee_aware_entry_filter = FeeAwareEntryFilter(self._fee_aware_entry_filter_config())
+        self.no_trade_guard = NoTradeBiasGuard(
+            config=self.config.get("no_trade_bias_guard", {}),
+            snapshot=self.no_trade_guard.snapshot() if hasattr(self, "no_trade_guard") else {},
+        )
+
+    @staticmethod
+    def _opportunity_value(opportunity: Any, name: str, default: Any = None) -> Any:
+        if isinstance(opportunity, dict):
+            return opportunity.get(name, default)
+        return getattr(opportunity, name, default)
+
+    def _opportunity_to_candidate_dict(
+        self,
+        opportunity: Any,
+        *,
+        filter_decision: Any = None,
+        eligible: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        components = self._opportunity_value(opportunity, "components", {})
+        if not isinstance(components, dict):
+            components = {}
+        direction = str(self._opportunity_value(opportunity, "direction", "")).lower()
+        reasons = []
+        if filter_decision is not None:
+            raw_reasons = getattr(filter_decision, "reasons", None)
+            if raw_reasons is None and isinstance(filter_decision, dict):
+                raw_reasons = filter_decision.get("reasons")
+            if isinstance(raw_reasons, (list, tuple, set)):
+                reasons = [str(item) for item in raw_reasons if str(item)]
+            elif raw_reasons:
+                reasons = [str(raw_reasons)]
+        allow = bool(getattr(filter_decision, "allow", eligible if eligible is not None else not reasons)) if filter_decision is not None else bool(eligible if eligible is not None else not reasons)
+        return {
+            "symbol": str(self._opportunity_value(opportunity, "symbol", "")).upper(),
+            "timeframe": str(self._opportunity_value(opportunity, "timeframe", "")),
+            "direction": direction,
+            "entry_price": self._opportunity_value(opportunity, "entry_price"),
+            "invalidation_price": self._opportunity_value(opportunity, "invalidation_price"),
+            "target_reference_price": self._opportunity_value(opportunity, "target_reference_price"),
+            "score": float(self._opportunity_value(opportunity, "signal_score", 0.0) or 0.0),
+            "signal_score": float(self._opportunity_value(opportunity, "signal_score", 0.0) or 0.0),
+            "fee_adjusted_rr": float(components.get("fee_adjusted_rr_value", components.get("fee_adjusted_rr", 0.0)) or 0.0),
+            "spread": components.get("spread"),
+            "current_spread": components.get("spread"),
+            "setup": str(self._opportunity_value(opportunity, "reason", "")),
+            "reason": str(self._opportunity_value(opportunity, "reason", "")),
+            "late_entry": bool(self._opportunity_value(opportunity, "late_entry", False)),
+            "eligible": allow,
+            "allow": allow,
+            "block_reasons": reasons,
+            "components": dict(components),
+        }
+
+    def _entry_filter_context(self, *, symbol: str, direction: str, position_count: int) -> Dict[str, Any]:
+        position_limits = self.config.get("position_limits", {}) if isinstance(self.config.get("position_limits", {}), dict) else {}
+        execution_cfg = self.config.get("execution", {}) if isinstance(self.config.get("execution", {}), dict) else {}
+        live_gate_open = bool(self.dry_run or self.mode == BotMode.BACKTEST or execution_cfg.get("live_trading_enabled", False))
+        return {
+            "symbol": str(symbol or "").upper(),
+            "direction": direction,
+            "setup_key": "v4_opportunity_scanner",
+            "daily_bleed_guard": self.daily_bleed_guard,
+            "now_ts": time.time(),
+            "open_positions_count": int(position_count),
+            "max_open_positions": int(position_limits.get("max_open_positions_total", 1) or 1),
+            "live_gate_open": live_gate_open,
+            "paper_only_mode": False,
+        }
+
+    def _scan_and_filter_opportunities(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        bars: Any,
+        position_count: int,
+    ) -> list[tuple[Any, Any, Dict[str, Any]]]:
+        if not self._opportunity_scanner_enabled():
+            return []
+        spread_points = None
+        spread_getter = getattr(self.broker, "get_live_spread", None)
+        if callable(spread_getter):
+            try:
+                spread_points = spread_getter(symbol)
+            except Exception:
+                spread_points = None
+        if spread_points is None:
+            risk_cfg = self.config.get("risk_per_trade", {}) if isinstance(self.config.get("risk_per_trade", {}), dict) else {}
+            spread_points = self._finite_optional_float(risk_cfg.get("spread_points")) or 0.0
+        opportunities = self.trade_opportunity_scanner.scan(
+            symbol=symbol,
+            timeframe=timeframe,
+            bars=bars,
+            spread=spread_points,
+        )
+        out: list[tuple[Any, Any, Dict[str, Any]]] = []
+        for opportunity in opportunities:
+            self.no_trade_guard.record_raw_signal(opportunity)
+            self.no_trade_guard.record_scored_signal(opportunity)
+            candidate = self._opportunity_to_candidate_dict(opportunity)
+            ctx = self._entry_filter_context(symbol=symbol, direction=str(candidate.get("direction", "")), position_count=position_count)
+            filter_decision = self.fee_aware_entry_filter.evaluate(candidate, ctx)
+            self.no_trade_guard.record_filter_decision(candidate, filter_decision)
+            candidate = self._opportunity_to_candidate_dict(opportunity, filter_decision=filter_decision)
+            self._active_opportunity_candidates.append(candidate)
+            out.append((opportunity, filter_decision, candidate))
+        return out
+
+    def _decision_from_opportunity(self, opportunity: Any, candidate: Dict[str, Any]) -> Optional[StrategyDecision]:
+        direction = str(candidate.get("direction", "")).lower()
+        action = DecisionAction.BUY if direction == "long" else DecisionAction.SELL if direction == "short" else None
+        if action is None:
+            return None
+        return StrategyDecision(
+            action=action,
+            reason=str(candidate.get("setup") or "V4_OPPORTUNITY_SCANNER_ENTRY"),
+            strategy="v4_opportunity_scanner",
+            confidence=float(candidate.get("score", 0.0) or 0.0) / 100.0,
+            sl=self._finite_optional_float(candidate.get("invalidation_price")),
+            tp=self._finite_optional_float(candidate.get("target_reference_price")),
+            metadata={
+                "v4_opportunity_scanner": True,
+                "entry_price": self._finite_optional_float(candidate.get("entry_price")),
+                "target_reference_price": self._finite_optional_float(candidate.get("target_reference_price")),
+                "signal_score": float(candidate.get("score", 0.0) or 0.0),
+                "fee_adjusted_rr": float(candidate.get("fee_adjusted_rr", 0.0) or 0.0),
+                "opportunity": dict(candidate),
+            },
+        )
+
+    def _write_v4_opportunity_reports(self) -> None:
+        if not self._opportunity_scanner_enabled() and "reports" not in self.config:
+            return
+        if not hasattr(self, "no_trade_guard"):
+            self.no_trade_guard = NoTradeBiasGuard(config=self.config.get("no_trade_bias_guard", {}))
+        reports_cfg = self.config.get("reports", {}) if isinstance(self.config.get("reports", {}), dict) else {}
+        if not bool(reports_cfg.get("enabled", True)):
+            return
+        output_dir = Path(str(reports_cfg.get("output_dir", "reports")))
+        try:
+            write_active_opportunity_reports(
+                {
+                    "current_symbols": [str(item.get("symbol", "")).strip().upper() for item in self.config.get("universe", []) or []],
+                    "current_timeframe": str((self.config.get("universe", [{}]) or [{}])[0].get("timeframe", "")),
+                    "opportunities": list(self._active_opportunity_candidates),
+                },
+                json_path=output_dir / "active_opportunities.json",
+                markdown_path=output_dir / "active_opportunities.md",
+            )
+            no_trade_snapshot = self.no_trade_guard.snapshot()
+            (output_dir / "no_trade_diagnostics.json").write_text(
+                build_no_trade_report_json(no_trade_snapshot) + "\n",
+                encoding="utf-8",
+            )
+            (output_dir / "no_trade_diagnostics.md").write_text(
+                build_no_trade_report_markdown(no_trade_snapshot),
+                encoding="utf-8",
+            )
+            self.store.append_event(
+                {
+                    "event": "v4_opportunity_reports_written",
+                    "output_dir": str(output_dir),
+                    "candidate_count": len(self._active_opportunity_candidates),
+                    "no_trade_status": no_trade_snapshot.get("status"),
+                }
+            )
+        except Exception as exc:
+            LOGGER.exception("Failed to write v4 opportunity reports")
+            self.store.append_event({"event": "v4_opportunity_report_error", "error": str(exc)})
+
     @classmethod
     def _normalize_runtime_universe(cls, config: Dict[str, Any]) -> Dict[str, Any]:
         cfg = dict(config or {})
@@ -817,6 +1089,7 @@ class TradingRuntime:
         self.execution_churn_guard.update_config(self.config.get("execution_churn_guard", {}))
         self.entry_quality_guard.update_config(self.config.get("entry_quality_guard", {}))
         self.cost_edge_guard.update_config(self.config.get("cost_edge_guard", {}))
+        self._refresh_v4_opportunity_runtime_stack()
         self.exit_quality_guard.update_config(self.config.get("exit_quality_guard", {}))
         self.mtf_confirm.update_config(self.config.get("mtf_confirm", {}))
         self.trade_journal = TradeJournal(self.config.get("trade_journal", {}))
@@ -1100,6 +1373,51 @@ class TradingRuntime:
     def _evaluate_profit_lock_for_position(self, position: Position) -> Optional[Any]:
         constraints = self.broker.get_symbol_constraints(position.symbol)
         contract_size = float(constraints.contract_size) if constraints is not None else 1.0
+        metadata = position.metadata if isinstance(position.metadata, dict) else {}
+        if self.v4_profit_lock_enabled:
+            current_price = self._to_float(metadata.get("price_current"), 0.0)
+            if current_price > 0:
+                net_pnl = self._to_float(metadata.get("floating_pnl"), 0.0) + self._to_float(metadata.get("swap"), 0.0) + self._to_float(metadata.get("commission"), 0.0)
+                decision = self.v4_profit_lock.evaluate(
+                    position=position,
+                    current_price=current_price,
+                    now=time.time(),
+                    symbol_spec=constraints,
+                    contract_size=contract_size,
+                    net_unrealized_pnl=net_pnl,
+                    record_update=False,
+                )
+                if decision.should_modify:
+                    modify = self.broker.modify_position_sl_tp(
+                        position=position,
+                        sl=decision.sl_price,
+                        tp=decision.tp_price if decision.tp_price is not None else position.tp,
+                        reason="v4_profit_lock",
+                    )
+                    self.store.append_event(
+                        {
+                            "event": "v4_profit_lock_sltp_sync",
+                            "symbol": str(position.symbol),
+                            "ticket": int(position.ticket),
+                            "sl": decision.sl_price,
+                            "tp": decision.tp_price,
+                            "lock_net_profit": decision.lock_net_profit,
+                            "target_net_profit": decision.target_net_profit,
+                            "trigger_net_profit": decision.trigger_net_profit,
+                            "net_unrealized_pnl": decision.net_unrealized_pnl,
+                            "result": modify.__dict__,
+                        }
+                    )
+                    if modify.ok:
+                        self.v4_profit_lock.mark_updated(position.ticket, time.time())
+                    else:
+                        self._queue_protection_retry(
+                            position=position,
+                            sl=decision.sl_price,
+                            tp=decision.tp_price if decision.tp_price is not None else position.tp,
+                            reason="v4_profit_lock",
+                            error_message=str(getattr(modify, "message", "") or ""),
+                        )
         sl_signal = self.trailing_guard.evaluate_profit_lock_sl(position=position, contract_size=contract_size)
         if sl_signal is not None and self.trailing_guard.break_even_sync_sl:
             modify = self.broker.modify_position_sl_tp(
@@ -1152,6 +1470,9 @@ class TradingRuntime:
         self.state["bar_gate"] = self.bar_gate.snapshot()
         self.state["risk_guard"] = self.risk_engine.snapshot()
         self.state["trailing_profit_guard"] = self.trailing_guard.snapshot()
+        self.state["daily_bleed_guard"] = self.daily_bleed_guard.snapshot()
+        if hasattr(self, "no_trade_guard"):
+            self.state["no_trade_bias_guard"] = self.no_trade_guard.snapshot()
         self.state["manual_position_guard"] = self.manual_position_guard.snapshot()
         self.state["execution_churn_guard"] = self.execution_churn_guard.snapshot()
         self.state["entry_quality_guard"] = self.entry_quality_guard.snapshot()
@@ -1190,6 +1511,16 @@ class TradingRuntime:
         )
         if report is not None:
             self.store.append_event({"event": "execution_churn_guard_trigger", **report})
+        if pnl is not None:
+            daily_report = self.daily_bleed_guard.record_trade_close(
+                symbol=symbol,
+                realized_pnl=float(pnl),
+                now_ts=time.time(),
+                direction=getattr(getattr(position, "side", None), "value", None),
+                setup_key=str(reason or ""),
+            )
+            self.store.append_event({"event": "daily_bleed_guard_update", **daily_report})
+            self.state["daily_bleed_guard"] = self.daily_bleed_guard.snapshot()
         journal = self.trade_journal.record_trade(
             symbol=str(symbol or "").upper(),
             reason=str(reason or ""),
@@ -1633,6 +1964,7 @@ class TradingRuntime:
         if current_equity is not None and daily_start_equity is not None:
             daily_pnl = current_equity - daily_start_equity
 
+        self._active_opportunity_candidates = []
         bars_by_symbol: Dict[str, Any] = {}
         for instrument in self.config.get("universe", []) or []:
             symbol = str(instrument.get("symbol", "")).strip()
@@ -1697,6 +2029,13 @@ class TradingRuntime:
             trailing_signal = None
             if position is not None and symbol_upper not in protected_symbols:
                 trailing_signal = self._evaluate_profit_lock_for_position(position)
+
+            opportunity_results = self._scan_and_filter_opportunities(
+                symbol=symbol,
+                timeframe=timeframe,
+                bars=bars,
+                position_count=len(broker_positions),
+            )
 
             daily_reference = dict(self._daily_reference_cache.get(symbol_upper, {}))
             context = StrategyEvaluationContext(
@@ -1770,6 +2109,30 @@ class TradingRuntime:
             decision = strategy.evaluate(symbol=symbol, bars=bars, position=position, context=context)
             if not isinstance(decision.metadata, dict):
                 decision.metadata = {}
+            if (
+                self._opportunity_scanner_drives_entries()
+                and position is None
+                and decision.action == DecisionAction.HOLD
+            ):
+                eligible = [item for item in opportunity_results if bool(getattr(item[1], "allow", False))]
+                if eligible:
+                    best_opportunity, _filter_decision, best_candidate = max(
+                        eligible, key=lambda item: float(item[2].get("score", 0.0) or 0.0)
+                    )
+                    scanner_decision = self._decision_from_opportunity(best_opportunity, best_candidate)
+                    if scanner_decision is not None:
+                        decision = scanner_decision
+                        self.store.append_event(
+                            {
+                                "event": "v4_opportunity_scanner_entry_selected",
+                                "symbol": symbol,
+                                "strategy": strategy_name,
+                                "action": decision.action.value,
+                                "score": best_candidate.get("score"),
+                                "fee_adjusted_rr": best_candidate.get("fee_adjusted_rr"),
+                                "reason": decision.reason,
+                            }
+                        )
             raw_decision = decision
             decision = self.exit_engine.choose(
                 position=position,
@@ -2056,6 +2419,8 @@ class TradingRuntime:
                     f"{symbol} {decision.action.value} EXECUTION EXCEPTION {strategy_name} | {exc}"
                 )
             if decision.action in {DecisionAction.BUY, DecisionAction.SELL} and result is not None and result.ok:
+                if isinstance(decision.metadata, dict) and bool(decision.metadata.get("v4_opportunity_scanner", False)):
+                    self.no_trade_guard.record_executed_trade(decision.metadata.get("opportunity"), now_ts=time.time())
                 self.execution_churn_guard.record_entry(symbol=symbol, now_ts=time.time())
                 decision.metadata["m5_align"] = bool(m5_allow)
                 if getattr(result, "ticket", None) is not None:
@@ -2105,9 +2470,12 @@ class TradingRuntime:
                     },
                 )
 
+        self._write_v4_opportunity_reports()
         self._run_auto_tuning_cycle(bars_by_symbol)
         self.state["entry_quality_guard"] = self.entry_quality_guard.snapshot()
         self.state["cost_edge_guard"] = self.cost_edge_guard.snapshot()
+        if hasattr(self, "no_trade_guard"):
+            self.state["no_trade_bias_guard"] = self.no_trade_guard.snapshot()
         self.state["exit_retry_guard"] = self.exit_retry_guard.snapshot()
 
         # snapshot strategy + runtime state

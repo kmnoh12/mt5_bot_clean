@@ -1,8 +1,8 @@
 mt5:
   init_timeout_ms: 60000
-  login: 410663362
+  login: 0
   server_time_offset_hours: 2.0
-  server: XMGlobal-MT5 16
+  server: REDACTED
   password: ''
   max_spread_points: 1200
   attach_only: true
@@ -29,9 +29,9 @@ general:
     max_ipc_failures_before_halt: 8
     force_shutdown_on_reconnect: false
 execution:
-  dry_run: false
+  dry_run: true
   live_trading_enabled: false
-  close_positions_on_exit: true
+  close_positions_on_exit: false
   default_volume: 0.01
   max_positions_per_symbol: 1
   allow_opposite_position: false
@@ -100,12 +100,12 @@ execution_churn_guard:
   loss_reentry_lock_seconds: 600
   max_entries_per_symbol_per_hour: 1
   max_entries_per_symbol_per_day: 2
-  max_entries_per_symbol_per_day_eth: 1
-  max_entries_global_per_day: 2
+  max_entries_per_symbol_per_day_eth: 0
+  max_entries_global_per_day: 1
   daily_reset_timezone: Asia/Seoul
   per_symbol_daily_limits:
     BTCUSD: 1
-    ETHUSD: 1
+    ETHUSD: 0
     SOLUSD: 0
     GOLD: 0
     Nvidia_turbo: 0
@@ -126,8 +126,6 @@ entry_quality_guard:
   enabled: true
   trend_only_symbols:
   - BTCUSD
-  - ETHUSD
-  - SOLUSD
   min_score: 0.62
   min_score_risk_off: 0.68
   min_score_risk_on: 0.58
@@ -137,9 +135,9 @@ entry_quality_guard:
   max_churn_hold_seconds: 300
 cost_edge_guard:
   enabled: true
-  min_edge_to_cost_ratio_default: 3.0
+  min_edge_to_cost_ratio_default: 2.0
   min_edge_to_cost_ratio_by_symbol:
-    BTCUSD: 3.0
+    BTCUSD: 2.0
     ETHUSD: 3.0
     SOLUSD: 3.0
     GOLD: 2.5
@@ -164,7 +162,7 @@ mtf_confirm:
   slow_ema: 50
 trade_journal:
   enabled: true
-  output_dir: ./reports/trade_journal
+  output_dir: ./reports/paper_forward_btc_trial61
   tiny_pnl_threshold_usd: 2.0
   quick_exit_window_seconds: 300
   big_loss_threshold_usd: -10.0
@@ -190,7 +188,6 @@ auto_tuning:
   enabled: false
   target_symbols:
   - BTCUSD
-  - ETHUSD
   tune_interval_seconds: 300
   lookback_bars: 120
   min_bars: 80
@@ -226,22 +223,38 @@ auto_tuning:
 validation:
   require_oos_pass: false
   report_path: ./validation/oos_report.json
+daily_bleed_guard:
+  enabled: true
+  max_daily_net_loss_usd: 3.0
+  stop_after_consecutive_losses: 3
+  cooldown_after_loss_minutes: 15
+  cooldown_after_same_setup_loss_minutes: 60
+  same_direction_loss_limit_per_day: 2
+  same_symbol_loss_limit_per_day: 3
+paper_forward_candidate:
+  enabled: true
+  live_apply: false
+  source_trial_id: 61
+  variant: conservative_daily_cap_3_00
+  symbol: BTCUSD
+  account_equity_reference_usd: 140
+  account_leverage_reference: 500
+  max_effective_leverage: 15.0
+  max_margin_used_pct: 5
+  target_net_loss_usd: 0.75
+  hard_max_net_loss_usd: 1.25
+  max_daily_net_loss_usd: 3.0
+  log_dir: ./reports/paper_forward_btc_trial61
 external_signals:
   enabled: false
   source: none
 required_active_symbols:
 - BTCUSD
-- ETHUSD
 nasdaq_universe:
 - BTCUSD
-- ETHUSD
 symbol_profiles: {}
 universe:
 - symbol: BTCUSD
-  strategy: liquidity_sweep_reversal
-  timeframe: TIMEFRAME_M1
-  volume: 0.01
-- symbol: ETHUSD
   strategy: liquidity_sweep_reversal
   timeframe: TIMEFRAME_M1
   volume: 0.01
@@ -257,9 +270,9 @@ strategies:
     tp_mult: 4.0
   liquidity_sweep_reversal:
     enabled: true
-    trail_atr_mult: 0.5
+    trail_atr_mult: 1.0
     trail_enabled: true
-    trail_start_R: 1.4
+    trail_start_R: 3.0
     trail_tp_enabled: true
     trail_tp_start_R: 1.2
     trail_tp_step_R: 0.6
@@ -289,21 +302,21 @@ strategies:
         atr_period: 28
         pivot_lookback_sec: 1800
         swing_window: 30
-        sweep_buffer_atr: 0.1
-        reclaim_buffer_atr: 0.1
-        reclaim_window_sec: 120
+        sweep_buffer_atr: 0.05
+        reclaim_buffer_atr: 0.05
+        reclaim_window_sec: 600
         reclaim_extension_sec: 120
         displacement_mult: 1.0
         displacement_lookback: 20
-        sl_atr_mult: 0.45
-        stop_buffer_atr: 0.05
+        sl_atr_mult: 0.35
+        stop_buffer_atr: 0.02
         tp_R1: 0.8
         tp_R2: 1.6
         be_at_R: 1.0
         max_hold_bars: 240
         zombie_bar_limit: 80
         min_hold_bars: 3
-        min_cooldown_bars: 15
+        min_cooldown_bars: 8
         trend_filter_enabled: false
         min_atr: 0.0005
       ETHUSD:

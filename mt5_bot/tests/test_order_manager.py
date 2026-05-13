@@ -15,6 +15,7 @@ from core.models import (
     StrategyDecision,
     SymbolConstraints,
 )
+from execution.daily_bleed_guard import DailyBleedGuard
 from execution.order_manager import OrderManager
 from execution.risk_engine import RiskEngine
 from storage.json_store import JsonStore
@@ -507,6 +508,158 @@ class OrderManagerTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertEqual(result.status, "RISK_PLAN_FAILED")
             self.assertIn("MIN_VOLUME_EXCEEDS_RISK_LIMIT", result.message)
+
+    def test_fee_aware_fixed_risk_sizes_lot_and_plans_wide_tp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broker = _FakeBroker(fail_first_precheck=False)
+            store = JsonStore(
+                state_path=Path(tmpdir) / "state.json",
+                events_path=Path(tmpdir) / "events.jsonl",
+            )
+            risk = RiskEngine({"risk_per_trade_pct": 0.015, "dynamic_lot_enabled": False})
+            manager = OrderManager(
+                broker=broker,
+                store=store,
+                notifier=_NoopNotifier(),
+                execution_cfg={
+                    "default_volume": 0.01,
+                    "fee_aware_fixed_risk": {
+                        "enabled": True,
+                        "target_net_loss_usd": 1.0,
+                        "hard_max_net_loss_usd": 1.25,
+                        "min_reward_to_net_risk_ratio": 3.0,
+                        "min_tp_net_profit_usd": 3.0,
+                        "preferred_tp_net_profit_usd": 5.0,
+                    },
+                },
+                risk_engine=risk,
+                dry_run=False,
+            )
+            decision = StrategyDecision(
+                action=DecisionAction.BUY,
+                reason="FEE_AWARE_ENTRY",
+                strategy="trend_regime_sm",
+                sl=99.0,
+                tp=None,
+                metadata={"signal_close": 100.0},
+            )
+
+            result = manager.process_decision(
+                instrument={"symbol": "BTCUSD", "volume": 0.01},
+                decision=decision,
+                current_position=None,
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertTrue(result.ok)
+            self.assertIsNotNone(broker.last_intent)
+            assert broker.last_intent is not None
+            self.assertAlmostEqual(broker.last_intent.volume, 1.0)
+            self.assertAlmostEqual(float(broker.last_intent.sl or 0.0), 99.0)
+            self.assertAlmostEqual(float(broker.last_intent.tp or 0.0), 105.0)
+            self.assertTrue(broker.last_intent.metadata.get("fee_aware"))
+            self.assertAlmostEqual(float(broker.last_intent.metadata.get("estimated_net_loss")), 1.0)
+
+    def test_fee_aware_fixed_risk_blocks_when_min_lot_exceeds_hard_max(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broker = _FakeBroker(fail_first_precheck=False)
+            store = JsonStore(
+                state_path=Path(tmpdir) / "state.json",
+                events_path=Path(tmpdir) / "events.jsonl",
+            )
+            risk = RiskEngine({"risk_per_trade_pct": 0.015, "dynamic_lot_enabled": False})
+            manager = OrderManager(
+                broker=broker,
+                store=store,
+                notifier=_NoopNotifier(),
+                execution_cfg={
+                    "default_volume": 0.01,
+                    "fee_aware_fixed_risk": {
+                        "enabled": True,
+                        "target_net_loss_usd": 1.0,
+                        "hard_max_net_loss_usd": 1.25,
+                    },
+                },
+                risk_engine=risk,
+                dry_run=False,
+            )
+            decision = StrategyDecision(
+                action=DecisionAction.BUY,
+                reason="FEE_AWARE_TOO_BIG",
+                strategy="trend_regime_sm",
+                sl=99.0,
+                tp=None,
+                metadata={"signal_close": 100.0},
+            )
+
+            result = manager.process_decision(
+                instrument={"symbol": "SILVER", "volume": 0.01},
+                decision=decision,
+                current_position=None,
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertFalse(result.ok)
+            self.assertEqual(result.status, "RISK_PLAN_FAILED")
+            self.assertIn("min_lot_risk_exceeds_hard_max", result.message)
+            self.assertIsNone(broker.last_intent)
+
+    def test_daily_bleed_guard_blocks_new_entry_but_not_hold_modify(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broker = _FakeBroker(fail_first_precheck=False)
+            store = JsonStore(
+                state_path=Path(tmpdir) / "state.json",
+                events_path=Path(tmpdir) / "events.jsonl",
+            )
+            risk = RiskEngine({"risk_per_trade_pct": 0.015, "dynamic_lot_enabled": False})
+            manager = OrderManager(
+                broker=broker,
+                store=store,
+                notifier=_NoopNotifier(),
+                execution_cfg={"default_volume": 0.1},
+                risk_engine=risk,
+                dry_run=False,
+            )
+            guard = DailyBleedGuard({"cooldown_after_loss_minutes": 30})
+            guard.record_trade_close("BTCUSD", -1.0, direction="BUY", setup_key="A")
+            guard.record_trade_close("BTCUSD", -1.0, direction="BUY", setup_key="B")
+            guard.record_trade_close("BTCUSD", -1.0, direction="BUY", setup_key="C")
+            manager.daily_bleed_guard = guard
+
+            blocked = manager.process_decision(
+                instrument={"symbol": "BTCUSD", "volume": 0.2},
+                decision=StrategyDecision(
+                    action=DecisionAction.BUY,
+                    reason="AFTER_LOSS",
+                    strategy="trend_regime_sm",
+                    sl=99.0,
+                    tp=105.0,
+                    metadata={"signal_close": 100.0, "setup_key": "B"},
+                ),
+                current_position=None,
+            )
+            self.assertIsNone(blocked)
+            self.assertEqual(broker.precheck_calls, 0)
+
+            position = Position(ticket=77, symbol="BTCUSD", side=Side.BUY, volume=0.1, price_open=100.0, sl=98.0, tp=None)
+            broker._positions[position.ticket] = position
+            modified = manager.process_decision(
+                instrument={"symbol": "BTCUSD", "volume": 0.2},
+                decision=StrategyDecision(
+                    action=DecisionAction.HOLD,
+                    reason="PROTECTION_MODIFY",
+                    strategy="trend_regime_sm",
+                    sl=99.0,
+                    tp=None,
+                ),
+                current_position=position,
+            )
+            self.assertIsNotNone(modified)
+            assert modified is not None
+            self.assertTrue(modified.ok)
+            self.assertEqual(float(broker._positions[position.ticket].sl), 99.0)
 
 
 if __name__ == "__main__":

@@ -41,3 +41,8 @@ mt5_bot/config_legacy_lsr_tick.yaml
 *.rar
 *.tar
 *.tar.gz
+
+# Generated reports (keep report Python modules tracked)
+mt5_bot/reports/**/*.json
+mt5_bot/reports/**/*.md
+mt5_bot/reports/**/*.csv
