@@ -41,6 +41,22 @@ execution:
     BTCUSD: 0.75
     ETHUSD: 0.75
     SOLUSD: 0.75
+
+# Small-account BTC LSR entry-gate baseline. Keeps loss/daily/position caps intact
+# while avoiding default 3R/$3-$5 initial-exit gates that contradict the active
+# LSR TP profile (~2.2R) and block otherwise bounded 0.7~0.9 USD risk entries.
+entry_quality:
+  min_reward_to_net_risk_ratio: 2.0
+  min_signal_score: 70
+  forbid_late_entry: true
+  require_deterministic_signal: true
+  allow_llm_discretionary_entry: false
+  allow_llm_discretionary_veto: false
+initial_exit:
+  take_profit:
+    min_profit_usd: 1.5
+    preferred_profit_usd: 2.0
+    allow_tp_extension: true
 risk_guard:
   risk_per_trade_pct: 0.002
   max_risk_per_trade_pct: 0.003
