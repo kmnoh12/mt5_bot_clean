@@ -141,7 +141,10 @@ cost_edge_guard:
   enabled: true
   min_edge_to_cost_ratio_default: 2.0
   min_edge_to_cost_ratio_by_symbol:
-    BTCUSD: 2.0
+    # After BTC entry-quality alignment, the first M5-confirmed LSR entry was
+    # blocked only by EDGE_TOO_LOW ratio 1.949 < 2.0. Lower BTC only to 1.9
+    # while keeping default/ETH/SOL/GOLD unchanged.
+    BTCUSD: 1.9
     ETHUSD: 3.0
     SOLUSD: 3.0
     GOLD: 2.5
