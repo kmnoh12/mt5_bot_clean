@@ -42,23 +42,48 @@ class MtfDirectionConfirm:
     def is_symbol_enabled(self, symbol: str) -> bool:
         return self.enabled and str(symbol or "").strip().upper() in self.symbols
 
-    def allow_entry(self, symbol: str, action: DecisionAction, bars: pd.DataFrame) -> bool:
+    def evaluate_entry(self, symbol: str, action: DecisionAction, bars: pd.DataFrame) -> Dict[str, Any]:
+        report: Dict[str, Any] = {
+            "allow": True,
+            "reason": "PASS",
+            "timeframe": self.confirm_timeframe,
+            "fast_ema_period": self.fast_ema,
+            "slow_ema_period": self.slow_ema,
+        }
         if action not in {DecisionAction.BUY, DecisionAction.SELL}:
-            return True
+            report["reason"] = "NON_ENTRY_ACTION"
+            return report
         if not self.is_symbol_enabled(symbol):
-            return True
+            report["reason"] = "SYMBOL_DISABLED"
+            return report
         clean = sanitize_ohlc(bars)
+        report["bars"] = 0 if clean is None else int(len(clean))
         if clean is None or len(clean) < (self.slow_ema + 2):
-            return False
+            report.update({"allow": False, "reason": "INSUFFICIENT_BARS"})
+            return report
         closed = clean.iloc[:-1].copy()
+        report["closed_bars"] = int(len(closed))
         if len(closed) < (self.slow_ema + 1):
-            return False
+            report.update({"allow": False, "reason": "INSUFFICIENT_CLOSED_BARS"})
+            return report
 
         ema_fast = compute_ema(closed, period=self.fast_ema)
         ema_slow = compute_ema(closed, period=self.slow_ema)
         if ema_fast is None or ema_slow is None:
-            return False
+            report.update({"allow": False, "reason": "EMA_UNAVAILABLE"})
+            return report
+
+        fast = float(ema_fast)
+        slow = float(ema_slow)
+        report.update({"ema_fast": fast, "ema_slow": slow})
 
         if action == DecisionAction.BUY:
-            return bool(float(ema_fast) > float(ema_slow))
-        return bool(float(ema_fast) < float(ema_slow))
+            allow = bool(fast > slow)
+            report.update({"allow": allow, "reason": "FAST_ABOVE_SLOW" if allow else "FAST_NOT_ABOVE_SLOW"})
+            return report
+        allow = bool(fast < slow)
+        report.update({"allow": allow, "reason": "FAST_BELOW_SLOW" if allow else "FAST_NOT_BELOW_SLOW"})
+        return report
+
+    def allow_entry(self, symbol: str, action: DecisionAction, bars: pd.DataFrame) -> bool:
+        return bool(self.evaluate_entry(symbol=symbol, action=action, bars=bars).get("allow", True))

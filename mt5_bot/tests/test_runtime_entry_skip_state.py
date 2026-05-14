@@ -95,6 +95,9 @@ class _MtfConfirm:
     def allow_entry(self, symbol: str, action, bars):  # noqa: ARG002
         return False
 
+    def evaluate_entry(self, symbol: str, action, bars):  # noqa: ARG002
+        return {"allow": False, "reason": "UNIT_TEST_M5_BLOCK", "bars": len(bars)}
+
 
 class _NoopExitEngine:
     @staticmethod
@@ -308,6 +311,9 @@ class RuntimeEntrySkipStateTests(unittest.TestCase):
             and event.get("reason") == "ENTRY_BLOCKED:M5_CONFIRM_BLOCK"
             for event in runtime.store.events
         ))
+        skip_events = [event for event in runtime.store.events if event.get("event") == "order_skip"]
+        self.assertEqual(skip_events[0].get("reason"), "M5_CONFIRM_BLOCK")
+        self.assertEqual(skip_events[0].get("m5_confirm", {}).get("reason"), "UNIT_TEST_M5_BLOCK")
 
 
 if __name__ == "__main__":

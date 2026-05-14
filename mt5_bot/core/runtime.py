@@ -2270,11 +2270,21 @@ class TradingRuntime:
                         timeframe=self.mtf_confirm.confirm_timeframe,
                         bars=self.bars_per_request,
                     )
-                    m5_allow = self.mtf_confirm.allow_entry(
-                        symbol=symbol,
-                        action=decision.action,
-                        bars=confirm_bars if confirm_bars is not None else bars,
-                    )
+                    m5_bars = confirm_bars if confirm_bars is not None else bars
+                    m5_report = None
+                    if hasattr(self.mtf_confirm, "evaluate_entry"):
+                        m5_report = self.mtf_confirm.evaluate_entry(
+                            symbol=symbol,
+                            action=decision.action,
+                            bars=m5_bars,
+                        )
+                        m5_allow = bool(m5_report.get("allow", True))
+                    else:
+                        m5_allow = self.mtf_confirm.allow_entry(
+                            symbol=symbol,
+                            action=decision.action,
+                            bars=m5_bars,
+                        )
                     if not m5_allow:
                         self.store.append_event(
                             {
@@ -2282,6 +2292,7 @@ class TradingRuntime:
                                 "symbol": symbol,
                                 "strategy": strategy_name,
                                 "reason": "M5_CONFIRM_BLOCK",
+                                "m5_confirm": m5_report,
                             }
                         )
                         self._skip_entry_and_cooldown(
