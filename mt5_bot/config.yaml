@@ -126,9 +126,13 @@ entry_quality_guard:
   enabled: true
   trend_only_symbols:
   - BTCUSD
-  min_score: 0.62
-  min_score_risk_off: 0.68
-  min_score_risk_on: 0.58
+  # LSR live decisions currently provide m5_align but not trend/adx/ema indicator
+  # features, so 0.62 made BTCUSD entries effectively impossible (observed
+  # score 0.20 / threshold 0.62). Keep M5 confirm/spread/daily caps intact,
+  # but let M5-confirmed LSR entries pass quality guard.
+  min_score: 0.2
+  min_score_risk_off: 0.25
+  min_score_risk_on: 0.2
   lookback_closed_trades: 200
   min_winner_pnl_usd: 5.0
   max_churn_abs_pnl_usd: 2.0
