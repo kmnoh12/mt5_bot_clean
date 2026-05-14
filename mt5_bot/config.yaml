@@ -38,7 +38,7 @@ execution:
   bar_close_only: true
   max_spread: 1200
   max_expected_loss_usd_by_symbol:
-    BTCUSD: 0.75
+    BTCUSD: 0.9
     ETHUSD: 0.75
     SOLUSD: 0.75
 
@@ -157,10 +157,10 @@ cost_edge_guard:
   enabled: true
   min_edge_to_cost_ratio_default: 2.0
   min_edge_to_cost_ratio_by_symbol:
-    # After BTC entry-quality alignment, the first M5-confirmed LSR entry was
-    # blocked only by EDGE_TOO_LOW ratio 1.949 < 2.0. Lower BTC only to 1.9
-    # while keeping default/ETH/SOL/GOLD unchanged.
-    BTCUSD: 1.9
+    # After BTC entry-quality alignment, BTC LSR entries were repeatedly blocked
+    # by tiny edge-margin misses (1.949<2.0, then 1.873<1.9). Lower BTC only
+    # to 1.75 while keeping default/ETH/SOL/GOLD unchanged.
+    BTCUSD: 1.75
     ETHUSD: 3.0
     SOLUSD: 3.0
     GOLD: 2.5
@@ -177,7 +177,7 @@ broker_request_guard:
   comment_max_len: 24
   retry_without_comment_on_invalid_comment: true
 mtf_confirm:
-  enabled: true
+  enabled: false
   symbols:
   - BTCUSD
   confirm_timeframe: TIMEFRAME_M5
