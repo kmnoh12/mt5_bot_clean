@@ -81,6 +81,22 @@ class LsrTickSweepReclaimTests(unittest.TestCase):
         self.assertLess(float(decision.tp or 0.0), 99.0)
         self.assertEqual(str(decision.metadata.get("sweep_level_name")), "PDH")
         self.assertGreaterEqual(float(decision.metadata.get("displacement_ratio", 0.0) or 0.0), 1.0)
+        self.assertEqual(decision.metadata["reclaim_quality"]["confirmation_path"], "tick_reclaim")
+        self.assertFalse(decision.metadata["reclaim_quality"]["retest_confirmed"])
+        self.assertEqual(decision.metadata["lsr_confirmation_flags"]["review_bucket"], "unconfirmed_reclaim_chase")
+        self.assertTrue(decision.metadata["lsr_confirmation_flags"]["lsr_unconfirmed_reclaim"])
+        self.assertTrue(decision.metadata["lsr_confirmation_flags"]["entry_chased_extension"])
+        self.assertFalse(decision.metadata["lsr_confirmation_flags"]["late_window_reclaim"])
+        self.assertFalse(decision.metadata["lsr_confirmation_flags"]["weak_reclaim_after_deep_sweep"])
+        self.assertIn("confirmation_score", decision.metadata["lsr_confirmation_flags"])
+        self.assertEqual(
+            decision.metadata["reclaim_quality"]["confirmation_flags"]["confirmation_score"],
+            decision.metadata["lsr_confirmation_flags"]["confirmation_score"],
+        )
+        self.assertAlmostEqual(decision.metadata["lsr_confirmation_flags"]["reclaim_window_elapsed_ratio"], 0.1)
+        self.assertAlmostEqual(float(decision.metadata["time_from_sweep_to_reclaim_sec"]), 2.0)
+        self.assertGreater(float(decision.metadata["reclaim_quality"]["reclaim_distance_atr"]), 0.0)
+        self.assertGreater(float(decision.metadata["reclaim_quality"]["sweep_depth_atr"]), 0.0)
 
     def test_reclaim_after_window_expires_does_not_enter(self) -> None:
         base_time = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)

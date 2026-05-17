@@ -15,6 +15,14 @@ def hard_reject_reasons(metrics: Mapping[str, Any], config: Mapping[str, Any]) -
     min_oos_trades = int(validation.get("min_oos_trades", 100) or 100)
     min_oos_profit_factor = float(validation.get("min_oos_profit_factor", 1.05) or 1.05)
     min_oos_expectancy = float(validation.get("min_oos_expectancy_net", 0.0) or 0.0)
+    min_oos_trading_days = int(validation.get("min_oos_trading_days", 0) or 0)
+    min_oos_trades_per_symbol = int(validation.get("min_oos_trades_per_symbol", 0) or 0)
+    min_oos_trading_days_per_symbol = int(validation.get("min_oos_trading_days_per_symbol", 0) or 0)
+    min_oos_trades_per_direction = int(validation.get("min_oos_trades_per_direction", 0) or 0)
+    raw_min_oos_trade_share_pct = validation.get("min_oos_trade_share_pct", 20.0)
+    min_oos_trade_share_pct = float(
+        raw_min_oos_trade_share_pct if raw_min_oos_trade_share_pct is not None else 20.0
+    )
     max_no_trade_days_pct = float(validation.get("max_no_trade_days_pct", 60.0) or 60.0)
     min_train_profit_factor = float(validation.get("min_train_profit_factor", 0.0) or 0.0)
     require_train_net_pnl_positive = bool(validation.get("require_train_net_pnl_positive", False))
@@ -31,6 +39,20 @@ def hard_reject_reasons(metrics: Mapping[str, Any], config: Mapping[str, Any]) -
         reasons.append("unexplained_no_trade_days")
     if int(metrics.get("oos_total_trades", metrics.get("total_trades", 0)) or 0) < min_oos_trades:
         reasons.append("oos_total_trades_lt_min")
+    if min_oos_trading_days > 0 and _oos_trading_day_count(metrics) < min_oos_trading_days:
+        reasons.append("oos_trading_days_lt_min")
+    if min_oos_trades_per_symbol > 0 and "oos_min_symbol_trades" in metrics:
+        if int(metrics.get("oos_min_symbol_trades", 0) or 0) < min_oos_trades_per_symbol:
+            reasons.append("oos_symbol_trades_lt_min")
+    if min_oos_trading_days_per_symbol > 0 and "oos_min_symbol_trading_days" in metrics:
+        if int(metrics.get("oos_min_symbol_trading_days", 0) or 0) < min_oos_trading_days_per_symbol:
+            reasons.append("oos_symbol_trading_days_lt_min")
+    if min_oos_trades_per_direction > 0 and "oos_min_direction_trades" in metrics:
+        if int(metrics.get("oos_min_direction_trades", 0) or 0) < min_oos_trades_per_direction:
+            reasons.append("oos_direction_trades_lt_min")
+    oos_trade_share_pct = _oos_trade_share_pct(metrics)
+    if oos_trade_share_pct is not None and oos_trade_share_pct < min_oos_trade_share_pct:
+        reasons.append("oos_trade_share_pct_lt_min")
     if float(metrics.get("oos_net_profit_factor", metrics.get("net_profit_factor", 0.0)) or 0.0) < min_oos_profit_factor:
         reasons.append("oos_net_profit_factor_lt_min")
     if float(metrics.get("oos_expectancy_net", metrics.get("expectancy_net", 0.0)) or 0.0) <= min_oos_expectancy:
@@ -58,6 +80,9 @@ def score_trials(trials: Iterable[TrialResult]) -> List[TrialResult]:
         "winner_capture_ratio": 0.5,
         "median_trades_per_day": 0.3,
         "oos_expectancy_net": 0.3,
+        "cost_drag_to_gross_ratio": -0.8,
+        "implementation_shortfall_to_gross_ratio": -0.8,
+        "gross_positive_net_nonpositive_rate": -0.6,
         "max_drawdown_pct": -1.5,
         "oos_decay_pct": -0.7,
         "margin_used_pct_max": -0.5,
@@ -85,3 +110,25 @@ def _normalize(value: float, low: float, high: float) -> float:
     if high <= low:
         return 0.0
     return (value - low) / (high - low)
+
+
+def _oos_trade_share_pct(metrics: Mapping[str, Any]) -> float | None:
+    if "oos_trade_share_pct" in metrics:
+        return float(metrics.get("oos_trade_share_pct", 0.0) or 0.0)
+    if "oos_total_trades" not in metrics:
+        return None
+    train_trades = int(metrics.get("total_trades", 0) or 0)
+    oos_trades = int(metrics.get("oos_total_trades", 0) or 0)
+    total = train_trades + oos_trades
+    if total <= 0:
+        return 0.0
+    return oos_trades / total * 100.0
+
+
+def _oos_trading_day_count(metrics: Mapping[str, Any]) -> int:
+    if "oos_trading_day_count" in metrics:
+        return int(metrics.get("oos_trading_day_count", 0) or 0)
+    raw_dates = metrics.get("oos_trade_dates")
+    if isinstance(raw_dates, (list, tuple, set)):
+        return len({str(item)[:10] for item in raw_dates if len(str(item or "")) >= 10})
+    return 0

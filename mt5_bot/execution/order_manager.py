@@ -203,6 +203,38 @@ class OrderManager:
             return value_f
         return round(value_f / point_f) * point_f
 
+    def _entry_metadata_with_spread_snapshot(
+        self,
+        *,
+        symbol: str,
+        decision: StrategyDecision,
+        plan_meta: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        metadata = {**decision.metadata, **plan_meta}
+
+        max_spread = self._finite_float(self.execution_cfg.get("max_spread"))
+        if max_spread is not None:
+            metadata.setdefault("max_spread_points", max_spread)
+
+        if any(key in metadata for key in ("spread_points", "current_spread", "current_spread_points", "spread")):
+            return metadata
+
+        spread_getter = getattr(self.broker, "get_live_spread", None)
+        if not callable(spread_getter):
+            return metadata
+
+        try:
+            spread = self._finite_float(spread_getter(symbol))
+        except Exception:
+            return metadata
+        if spread is None:
+            return metadata
+
+        metadata["spread_points"] = spread
+        metadata["current_spread"] = spread
+        metadata["spread_snapshot_source"] = "broker.get_live_spread"
+        return metadata
+
     def _adjust_stops_for_constraints(
         self,
         *,
@@ -332,6 +364,133 @@ class OrderManager:
             },
         }
         return meta
+
+    def _expected_loss_cap_for_symbol(self, symbol: str) -> Optional[float]:
+        caps = []
+        max_loss_map = self.execution_cfg.get("max_expected_loss_usd_by_symbol", {}) or {}
+        if isinstance(max_loss_map, dict):
+            for key in (symbol, str(symbol or "").upper()):
+                raw_cap = max_loss_map.get(key)
+                cap = self._finite_float(raw_cap)
+                if cap is not None and cap > 0:
+                    caps.append(float(cap))
+                    break
+        fee_cfg = self._fee_aware_fixed_risk_config()
+        if fee_cfg is not None:
+            cap = self._finite_float(fee_cfg.get("hard_max_net_loss_usd"))
+            if cap is not None and cap > 0:
+                caps.append(float(cap))
+        if not caps:
+            return None
+        return float(min(caps))
+
+    def _estimate_intent_loss_usd(self, intent: OrderIntent, constraints: SymbolConstraints) -> Optional[float]:
+        metadata = dict(intent.metadata or {})
+        entry = self._finite_float(metadata.get("signal_close"))
+        if entry is None:
+            entry = self._finite_float(metadata.get("entry_price"))
+        if entry is None:
+            entry = self._finite_float(metadata.get("anchor"))
+        sl = self._finite_float(intent.sl)
+        if entry is None or sl is None:
+            return None
+
+        risk_model = metadata.get("risk_model")
+        risk_model = dict(risk_model) if isinstance(risk_model, dict) else {}
+        tick_size = self._finite_float(risk_model.get("tick_size"))
+        if tick_size is None:
+            tick_size = self._constraint_tick_size(constraints)
+        tick_value = self._finite_float(risk_model.get("tick_value"))
+        if tick_value is None:
+            tick_value = self._constraint_tick_value(constraints, self._fee_aware_fixed_risk_config() or {})
+        spread = self._finite_float(risk_model.get("spread"))
+        if spread is None:
+            spread_points = self._finite_float(metadata.get("spread_points"))
+            spread = (spread_points or 0.0) * float(tick_size)
+        commission = self._finite_float(risk_model.get("commission_per_lot"))
+        if commission is None:
+            commission = self._finite_float(metadata.get("commission_per_lot")) or 0.0
+        slippage_points = self._finite_float(risk_model.get("expected_slippage_points"))
+        if slippage_points is None:
+            slippage_points = self._finite_float(metadata.get("expected_slippage_points")) or 0.0
+
+        try:
+            estimate = self.fee_aware_risk_model.estimate(
+                FeeAwareRiskInput(
+                    symbol=str(intent.symbol),
+                    entry_price=float(entry),
+                    stop_price=float(sl),
+                    direction="long" if intent.side == Side.BUY else "short",
+                    lot=float(intent.volume),
+                    spread=max(0.0, float(spread or 0.0)),
+                    commission_per_lot=max(0.0, float(commission or 0.0)),
+                    expected_slippage_points=max(0.0, float(slippage_points or 0.0)),
+                    tick_size=max(1e-12, float(tick_size)),
+                    tick_value=max(1e-12, float(tick_value)),
+                    contract_size=float(getattr(constraints, "contract_size", 1.0) or 1.0),
+                    take_profit_price=self._finite_float(intent.tp),
+                    hard_max_net_loss_usd=self._expected_loss_cap_for_symbol(str(intent.symbol)),
+                )
+            )
+            return float(estimate.estimated_net_loss_usd)
+        except Exception:
+            pass
+
+        previous_loss = self._finite_float(metadata.get("estimated_net_loss"))
+        if previous_loss is None:
+            expected_pnl = self._finite_float(metadata.get("expected_pnl_usd"))
+            previous_loss = abs(float(expected_pnl)) if expected_pnl is not None else None
+        previous_risk = self._finite_float(metadata.get("risk_per_unit"))
+        if previous_loss is None or previous_risk is None or previous_risk <= 0:
+            return None
+        adjusted_risk = abs(float(entry) - float(sl))
+        return float(previous_loss) * (float(adjusted_risk) / float(previous_risk))
+
+    def _block_stop_adjustment_if_over_cap(
+        self,
+        *,
+        intent: OrderIntent,
+        constraints: SymbolConstraints,
+        symbol: str,
+        strategy: str,
+        phase: str,
+        adjustment: Dict[str, Any],
+    ) -> Optional[OrderResult]:
+        cap = self._expected_loss_cap_for_symbol(symbol)
+        if cap is None:
+            return None
+        adjusted_loss = self._estimate_intent_loss_usd(intent, constraints)
+        if adjusted_loss is None or adjusted_loss <= cap + 1e-12:
+            return None
+        details = {
+            "expected_loss_usd": float(adjusted_loss),
+            "max_expected_loss_usd": float(cap),
+            "adjustment": dict(adjustment or {}),
+        }
+        self.store.append_event(
+            {
+                "event": "order_skip",
+                "symbol": symbol,
+                "strategy": strategy,
+                "reason": "EXPECTED_LOSS_CAP_AFTER_STOP_ADJUSTMENT",
+                "details": details,
+            }
+        )
+        self.store.append_event(
+            {
+                "event": "invalid_stops_adjustment_blocked_by_cap",
+                "symbol": symbol,
+                "strategy": strategy,
+                "phase": phase,
+                "details": details,
+            }
+        )
+        return OrderResult(
+            ok=False,
+            status="EXPECTED_LOSS_CAP_AFTER_STOP_ADJUSTMENT",
+            message=f"adjusted stop loss {adjusted_loss:.2f} exceeds cap {cap:.2f}",
+            raw=details,
+        )
 
     @staticmethod
     def _volume_precision(step: float) -> int:
@@ -1203,7 +1362,11 @@ class OrderManager:
             sl=sl_val,
             tp=tp_val,
             external_signal_id=decision.metadata.get("external_signal_id"),
-            metadata={**decision.metadata, **plan_meta},
+            metadata=self._entry_metadata_with_spread_snapshot(
+                symbol=symbol,
+                decision=decision,
+                plan_meta=plan_meta,
+            ),
         )
 
         if self.dry_run:
@@ -1222,6 +1385,16 @@ class OrderManager:
                     symbol=symbol,
                 )
                 if precheck_retry_meta is not None:
+                    cap_block = self._block_stop_adjustment_if_over_cap(
+                        intent=intent,
+                        constraints=constraints,
+                        symbol=symbol,
+                        strategy=strategy,
+                        phase="precheck",
+                        adjustment=precheck_retry_meta,
+                    )
+                    if cap_block is not None:
+                        return cap_block
                     precheck = self.broker.precheck_order(intent)
                     self.store.append_event(
                         {
@@ -1243,6 +1416,16 @@ class OrderManager:
                             min_distance_points_override=second_floor,
                         )
                         if precheck_retry_meta_2 is not None:
+                            cap_block = self._block_stop_adjustment_if_over_cap(
+                                intent=intent,
+                                constraints=constraints,
+                                symbol=symbol,
+                                strategy=strategy,
+                                phase="precheck_retry2",
+                                adjustment=precheck_retry_meta_2,
+                            )
+                            if cap_block is not None:
+                                return cap_block
                             precheck = self.broker.precheck_order(intent)
                             self.store.append_event(
                                 {
@@ -1300,6 +1483,16 @@ class OrderManager:
                     symbol=symbol,
                 )
                 if send_retry_meta is not None:
+                    cap_block = self._block_stop_adjustment_if_over_cap(
+                        intent=intent,
+                        constraints=constraints,
+                        symbol=symbol,
+                        strategy=strategy,
+                        phase="send",
+                        adjustment=send_retry_meta,
+                    )
+                    if cap_block is not None:
+                        return cap_block
                     self.store.append_event(
                         {
                             "event": "order_stops_auto_adjusted",

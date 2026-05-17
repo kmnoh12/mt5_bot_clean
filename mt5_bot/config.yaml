@@ -10,13 +10,11 @@ mt5:
   allow_terminal_launch: true
   close_terminal_on_exit: true
   account_guard_enabled: true
-  require_trade_enabled: false
+  require_trade_enabled: true
   reconnect_init_timeout_ms: 15000
-  require_trade_enabled_note: false only for dry-run/paper startup; live order gate
-    remains closed
 general:
   mode: live
-  dry_run: true
+  dry_run: false
   poll_seconds: 1.0
   heartbeat_seconds: 60
   reconnect:
@@ -29,56 +27,50 @@ general:
     max_ipc_failures_before_halt: 8
     force_shutdown_on_reconnect: false
 execution:
-  dry_run: true
-  live_trading_enabled: false
   close_positions_on_exit: false
   default_volume: 0.01
   max_positions_per_symbol: 1
   allow_opposite_position: false
-  bar_close_only: true
-  max_spread: 1200
+  bar_close_only: false
+  max_spread: 6000
   max_expected_loss_usd_by_symbol:
-    BTCUSD: 0.9
-    ETHUSD: 0.75
-    SOLUSD: 0.75
-
-# Small-account BTC LSR entry-gate baseline. Keeps loss/daily/position caps intact
-# while avoiding default 3R/$3-$5 initial-exit gates that contradict the active
-# LSR TP profile (~2.2R) and block otherwise bounded 0.7~0.9 USD risk entries.
-entry_quality:
-  min_reward_to_net_risk_ratio: 2.0
-  min_signal_score: 70
-  forbid_late_entry: true
-  require_deterministic_signal: true
-  allow_llm_discretionary_entry: false
-  allow_llm_discretionary_veto: false
-initial_exit:
-  take_profit:
-    min_profit_usd: 1.5
-    preferred_profit_usd: 2.0
-    allow_tp_extension: true
+    BTCUSD: 1.7
+  dry_run: false
+  live_trading_enabled: true
+  fee_aware_fixed_risk:
+    enabled: true
+    target_net_loss_usd: 1.0
+    hard_max_net_loss_usd: 1.7
+    commission_per_lot: 0.0
+    spread_points: 0.0
+    expected_slippage_points: 0.0
+    min_reward_to_net_risk_ratio: 0.35
+    min_tp_net_profit_usd: 0.3
+    preferred_tp_net_profit_usd: 0.5
 risk_guard:
-  risk_per_trade_pct: 0.002
-  max_risk_per_trade_pct: 0.003
-  daily_loss_limit_pct: 0.015
-  session_loss_limit_pct: 0.02
-  max_consecutive_losses: 4
+  risk_per_trade_pct: 0.005
+  max_risk_per_trade_pct: 0.01
+  daily_loss_limit_pct: 0.03
+  session_loss_limit_pct: 0.05
+  max_consecutive_losses: 6
   auto_resume_daily_drawdown_on_new_day: true
   auto_resume_after_halt_minutes: 0
   manual_resume_resets_daily_baseline: true
   dynamic_risk_cap_enabled: true
-  dynamic_risk_min_pct: 0.001
-  dynamic_risk_max_pct: 0.003
+  dynamic_risk_min_pct: 0.005
+  dynamic_risk_max_pct: 0.03
   dynamic_risk_lookback_hours: 24
   dynamic_risk_min_samples: 8
   dynamic_risk_winrate_floor: 0.35
   dynamic_risk_winrate_ceiling: 0.65
   dynamic_lot_enabled: true
-  dynamic_lot_fail_mode: block
+  dynamic_lot_fail_mode: fallback
   dynamic_lot_default_lot: 0.01
   dynamic_lot_min_volume_policy: block
-  kelly_fraction: 0.25
-  dd_hard_stop_pct: 0.08
+  kelly_fraction: 0.5
+  dd_hard_stop_pct: 0.12
+  max_loss_usd: 1.7
+  daily_loss_limit_usd: 3.0
 trailing_profit_guard:
   enabled: true
   retain_ratio: 0.5
@@ -108,46 +100,38 @@ manual_position_guard:
   block_strategy_for_protected_symbols: false
 execution_churn_guard:
   enabled: true
-  reentry_cooldown_seconds: 300
-  flip_reentry_cooldown_seconds: 180
-  protection_retry_interval_seconds: 2.0
-  protection_retry_max_attempts: 8
-  protection_failure_lock_seconds: 120
-  loss_reentry_lock_seconds: 600
-  max_entries_per_symbol_per_hour: 1
-  max_entries_per_symbol_per_day: 2
-  max_entries_per_symbol_per_day_eth: 0
-  max_entries_global_per_day: 1
+  reentry_cooldown_seconds: 10
+  flip_reentry_cooldown_seconds: 5
+  max_entries_per_symbol_per_hour: 10
+  max_entries_per_symbol_per_day: 20
+  max_entries_global_per_day: 30
   daily_reset_timezone: Asia/Seoul
   per_symbol_daily_limits:
-    BTCUSD: 1
-    ETHUSD: 0
-    SOLUSD: 0
+    BTCUSD: 20
+    SOLUSD: 20
     GOLD: 0
-    Nvidia_turbo: 0
-    AMD_turbo: 0
-  min_hold_bars_floor: 2
+    NVIDIA_TURBO: 0
+    AMD_TURBO: 0
+    ETHUSD: 0
+  min_hold_bars_floor: 1
   min_hold_bars_floor_by_symbol:
-    BTCUSD: 3
-    ETHUSD: 3
-    SOLUSD: 5
+    BTCUSD: 1
+    SOLUSD: 1
     GOLD: 2
-    Nvidia_turbo: 2
-    AMD_turbo: 2
-  tiny_pnl_threshold_usd: 1.5
-  quick_exit_window_seconds: 180
-  tiny_pnl_max_count_per_hour: 2
-  tiny_pnl_cooldown_seconds: 3600
+  tiny_pnl_threshold_usd: 1.0
+  quick_exit_window_seconds: 120
+  tiny_pnl_max_count_per_hour: 10
+  tiny_pnl_cooldown_seconds: 300
+  protection_retry_interval_seconds: 2.0
+  protection_retry_max_attempts: 8
+  protection_failure_lock_seconds: 60
+  loss_reentry_lock_seconds: 60
 entry_quality_guard:
   enabled: true
   trend_only_symbols:
   - BTCUSD
-  # LSR live decisions currently provide m5_align but not trend/adx/ema indicator
-  # features, so 0.62 made BTCUSD entries effectively impossible (observed
-  # score 0.20 / threshold 0.62). Keep M5 confirm/spread/daily caps intact,
-  # but let M5-confirmed LSR entries pass quality guard.
   min_score: 0.2
-  min_score_risk_off: 0.25
+  min_score_risk_off: 0.2
   min_score_risk_on: 0.2
   lookback_closed_trades: 200
   min_winner_pnl_usd: 5.0
@@ -155,15 +139,11 @@ entry_quality_guard:
   max_churn_hold_seconds: 300
 cost_edge_guard:
   enabled: true
-  min_edge_to_cost_ratio_default: 2.0
+  min_edge_to_cost_ratio_default: 1.1
   min_edge_to_cost_ratio_by_symbol:
-    # After BTC entry-quality alignment, BTC LSR entries were repeatedly blocked
-    # by tiny edge-margin misses (1.949<2.0, then 1.873<1.9). Lower BTC only
-    # to 1.75 while keeping default/ETH/SOL/GOLD unchanged.
-    BTCUSD: 1.75
-    ETHUSD: 3.0
-    SOLUSD: 3.0
-    GOLD: 2.5
+    GOLD: 1.0
+    BTCUSD: 0.3
+    SOLUSD: 0.3
   spread_sample_bars: 120
   use_recent_deal_cost_stats: true
 exit_quality_guard:
@@ -185,7 +165,7 @@ mtf_confirm:
   slow_ema: 50
 trade_journal:
   enabled: true
-  output_dir: ./reports/paper_forward_btc_trial61
+  output_dir: ./reports/trade_journal
   tiny_pnl_threshold_usd: 2.0
   quick_exit_window_seconds: 300
   big_loss_threshold_usd: -10.0
@@ -211,6 +191,10 @@ auto_tuning:
   enabled: false
   target_symbols:
   - BTCUSD
+  - ETHUSD
+  - GOLD
+  - Nvidia_turbo
+  - AMD_turbo
   tune_interval_seconds: 300
   lookback_bars: 120
   min_bars: 80
@@ -246,41 +230,81 @@ auto_tuning:
 validation:
   require_oos_pass: false
   report_path: ./validation/oos_report.json
-daily_bleed_guard:
-  enabled: true
-  max_daily_net_loss_usd: 3.0
-  stop_after_consecutive_losses: 3
-  cooldown_after_loss_minutes: 15
-  cooldown_after_same_setup_loss_minutes: 60
-  same_direction_loss_limit_per_day: 2
-  same_symbol_loss_limit_per_day: 3
-paper_forward_candidate:
-  enabled: true
-  live_apply: false
-  source_trial_id: 61
-  variant: conservative_daily_cap_3_00
-  symbol: BTCUSD
-  account_equity_reference_usd: 140
-  account_leverage_reference: 500
-  max_effective_leverage: 15.0
-  max_margin_used_pct: 5
-  target_net_loss_usd: 0.75
-  hard_max_net_loss_usd: 1.25
-  max_daily_net_loss_usd: 3.0
-  log_dir: ./reports/paper_forward_btc_trial61
 external_signals:
   enabled: false
   source: none
 required_active_symbols:
 - BTCUSD
 nasdaq_universe:
-- BTCUSD
-symbol_profiles: {}
+- Nvidia_turbo
+- AMD_turbo
+symbol_profiles:
+  GOLD:
+    universe:
+      strategy: liquidity_sweep_reversal_tick
+      timeframe: TIMEFRAME_M1
+      volume: 0.01
+    risk_guard:
+      risk_per_trade_pct: 0.007
+    execution_churn_guard:
+      per_symbol_daily_limit: 3
+      min_hold_bars_floor: 2
+    cost_edge_guard:
+      min_edge_to_cost_ratio: 1.0
+    strategies:
+      liquidity_sweep_reversal:
+        displacement_mult: 0.6
+        sl_atr_mult: 0.8
+        zombie_bar_limit: 40
+        stop_buffer_atr: 0.18
+        min_cooldown_bars: 15
+        trail_start_R: 1.2
+        reclaim_window_sec: 1200
+  SOLUSD:
+    universe:
+      strategy: liquidity_sweep_reversal
+      timeframe: TIMEFRAME_M1
+      volume: 0.05
+    risk_guard:
+      risk_per_trade_pct: 0.002
+    execution_churn_guard:
+      per_symbol_daily_limit: 4
+      min_hold_bars_floor: 5
+    strategies:
+      liquidity_sweep_reversal:
+        trend_filter_enabled: true
+        sl_atr_mult: 0.45
+        stop_buffer_atr: 0.08
+        min_cooldown_bars: 6
+  Nvidia_turbo:
+    universe:
+      strategy: liquidity_sweep_reversal
+      timeframe: TIMEFRAME_M1
+      volume: 0.01
+    strategies:
+      liquidity_sweep_reversal:
+        displacement_mult: 0.5
+        sweep_buffer_atr: 0.006
+        reclaim_window_sec: 1800
+  AMD_turbo:
+    universe:
+      strategy: liquidity_sweep_reversal
+      timeframe: TIMEFRAME_M1
+      volume: 0.01
+    strategies:
+      liquidity_sweep_reversal:
+        displacement_mult: 0.5
+        sweep_buffer_atr: 0.006
+        reclaim_window_sec: 1800
 universe:
 - symbol: BTCUSD
   strategy: liquidity_sweep_reversal
   timeframe: TIMEFRAME_M1
   volume: 0.01
+- symbol: SOLUSD
+  strategy: liquidity_sweep_reversal
+  timeframe: TIMEFRAME_M1
+  volume: 0.05
 strategies:
   deep_wave_sm:
     enabled: false
@@ -293,9 +317,9 @@ strategies:
     tp_mult: 4.0
   liquidity_sweep_reversal:
     enabled: true
-    trail_atr_mult: 1.0
+    trail_atr_mult: 0.5
     trail_enabled: true
-    trail_start_R: 3.0
+    trail_start_R: 1.4
     trail_tp_enabled: true
     trail_tp_start_R: 1.2
     trail_tp_step_R: 0.6
@@ -303,80 +327,62 @@ strategies:
     atr_period: 14
     pivot_lookback_sec: 1800
     swing_window: 45
-    sweep_buffer_atr: 0.008
-    reclaim_buffer_atr: 0.012
-    reclaim_window_sec: 900
-    reclaim_extension_sec: 180
-    displacement_mult: 0.9
+    sweep_buffer_atr: 0.002
+    reclaim_buffer_atr: 0.004
+    reclaim_window_sec: 3600
+    reclaim_extension_sec: 900
+    displacement_mult: 0.35
     displacement_lookback: 20
-    sl_atr_mult: 0.9
-    stop_buffer_atr: 0.16
+    sl_atr_mult: 0.65
+    stop_buffer_atr: 0.08
     tp_R1: 2.0
-    tp_R2: 4.0
+    tp_R2: 2.4
     be_at_R: 1.0
     max_hold_bars: 80
-    zombie_bar_limit: 25
+    zombie_bar_limit: 90
     min_hold_bars: 3
-    min_cooldown_bars: 8
+    min_cooldown_bars: 1
     fvg_enabled: false
-    retest_enabled: false
+    retest_enabled: true
     symbol_params:
       BTCUSD:
-        atr_period: 28
-        pivot_lookback_sec: 1800
-        swing_window: 30
-        sweep_buffer_atr: 0.05
-        reclaim_buffer_atr: 0.05
-        reclaim_window_sec: 600
-        reclaim_extension_sec: 120
-        displacement_mult: 1.0
-        displacement_lookback: 20
-        sl_atr_mult: 0.35
-        stop_buffer_atr: 0.02
-        tp_R1: 0.8
-        tp_R2: 1.6
-        be_at_R: 1.0
-        max_hold_bars: 240
-        zombie_bar_limit: 80
-        min_hold_bars: 3
-        min_cooldown_bars: 8
-        trend_filter_enabled: false
-        min_atr: 0.0005
-      ETHUSD:
-        atr_period: 28
-        pivot_lookback_sec: 1800
-        swing_window: 30
-        sweep_buffer_atr: 0.16
-        reclaim_buffer_atr: 0.0
-        reclaim_window_sec: 120
-        reclaim_extension_sec: 120
-        displacement_mult: 1.0
-        displacement_lookback: 20
-        sl_atr_mult: 0.45
-        stop_buffer_atr: 0.05
-        tp_R1: 0.8
-        tp_R2: 4.5
-        be_at_R: 1.0
-        max_hold_bars: 1440
-        zombie_bar_limit: 120
-        min_hold_bars: 3
-        min_cooldown_bars: 15
-        trend_filter_enabled: false
-        min_atr: 0.0005
-      SOLUSD:
-        displacement_mult: 0.45
+        displacement_mult: 0.25
         trend_filter_enabled: true
+        sweep_buffer_atr: 0.0015
+        reclaim_extension_sec: 1200
+        reclaim_window_sec: 3600
+        zombie_bar_limit: 120
+        min_cooldown_bars: 3
+        min_atr: 0.0
+        reclaim_buffer_atr: 0.003
+        sl_atr_mult: 0.75
+        stop_buffer_atr: 0.12
+        tp_R2: 2.2
+        retest_enabled: true
+        retest_window_bars: 6
+        trend_filter_ema_period: 50
+      ETHUSD:
+        displacement_mult: 0.4
         sweep_buffer_atr: 0.005
-        reclaim_buffer_atr: 0.007
         reclaim_window_sec: 2400
         reclaim_extension_sec: 600
-        sl_atr_mult: 0.45
-        stop_buffer_atr: 0.08
-        max_hold_bars: 80
-        zombie_bar_limit: 50
-        tp_R2: 3.0
-        min_cooldown_bars: 6
         retest_window_bars: 8
+      SOLUSD:
+        displacement_mult: 0.28
+        trend_filter_enabled: false
+        sweep_buffer_atr: 0.0015
+        reclaim_buffer_atr: 0.003
+        reclaim_window_sec: 3600
+        reclaim_extension_sec: 1200
+        sl_atr_mult: 0.4
+        stop_buffer_atr: 0.06
+        max_hold_bars: 80
+        zombie_bar_limit: 120
+        tp_R2: 2.2
+        min_cooldown_bars: 1
+        retest_window_bars: 8
+        min_atr: 0.0
+    retest_window_bars: 6
   trend_regime_sm:
     enabled: false
     fast_ema_period: 20
@@ -432,3 +438,22 @@ strategies:
 logging:
   file: mt5_bot.log
   level: INFO
+entry_quality:
+  min_reward_to_net_risk_ratio: 0.35
+initial_exit:
+  take_profit:
+    min_profit_usd: 0.3
+    preferred_profit_usd: 0.5
+opportunity_scanner:
+  enabled: true
+  drive_entries: true
+  lookback_bars: 12
+  atr_period: 14
+  min_signal_score: 10.0
+  sweep_buffer_atr: 0.002
+  stop_buffer_atr: 0.04
+  min_atr: 0.0
+  late_entry_atr_mult: 1.25
+  late_entry_min_rr: 0.8
+daily_bleed_guard:
+  cooldown_after_loss_minutes: 30

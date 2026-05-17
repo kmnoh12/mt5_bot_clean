@@ -198,7 +198,7 @@ class EntryQualityGuard:
         )
         threshold, mode = self._risk_mode_threshold()
         self._last_score_by_symbol[symbol_key] = float(score)
-        allow = bool(score >= threshold)
+        allow = bool((score + 1e-12) >= threshold)
         return {
             "allow": allow,
             "score": float(score),

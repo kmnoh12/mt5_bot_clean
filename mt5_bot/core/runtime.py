@@ -681,6 +681,56 @@ class TradingRuntime:
             details=details,
         )
 
+    def _skip_entry_without_cooldown(
+        self,
+        *,
+        strategy: Any,
+        symbol: str,
+        strategy_name: str,
+        reason: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        marker = getattr(strategy, "mark_entry_rejected_no_trade", None)
+        marked = False
+        if callable(marker):
+            try:
+                marker(symbol=symbol, reason=str(reason or "ENTRY_REJECTED_NO_TRADE"))
+                marked = True
+            except Exception:
+                LOGGER.exception(
+                    "Failed to mark rejected entry without cooldown. symbol=%s strategy=%s",
+                    symbol,
+                    strategy_name,
+                )
+        if not marked:
+            getter = getattr(strategy, "get_symbol_state", None)
+            if callable(getter):
+                try:
+                    st = getter(symbol)
+                    st.pending_order = False
+                    if getattr(st, "state", None) == StrategyState.ENTRY_PENDING:
+                        st.state = StrategyState.IDLE
+                    st.last_reason = str(reason or "ENTRY_REJECTED_NO_TRADE")
+                    st.updated_at_utc = datetime.now(timezone.utc)
+                    marked = True
+                except Exception:
+                    LOGGER.exception(
+                        "Failed to clear rejected pending entry. symbol=%s strategy=%s",
+                        symbol,
+                        strategy_name,
+                    )
+        self.store.append_event(
+            {
+                "event": "rejected_setup_no_trade",
+                "symbol": symbol,
+                "strategy": strategy_name,
+                "reason": str(reason or "ENTRY_REJECTED_NO_TRADE"),
+                "cooldown_applied": False,
+                "state_cleared": bool(marked),
+                "details": dict(details or {}),
+            }
+        )
+
     def _force_all_active_strategies_cooldown(self, reason: str) -> None:
         seen: set[tuple[str, str]] = set()
         for instrument in self.config.get("universe", []) or []:
@@ -746,6 +796,41 @@ class TradingRuntime:
         if not math.isfinite(out):
             return None
         return out
+
+    def _entry_spread_from_metadata(self, metadata: Dict[str, Any]) -> Optional[float]:
+        for key in ("current_spread", "spread_points", "current_spread_points", "spread"):
+            value = self._finite_optional_float(metadata.get(key))
+            if value is not None:
+                return value
+        return None
+
+    def _annotate_entry_spread_snapshot(self, *, symbol: str, decision: StrategyDecision) -> Optional[float]:
+        if not isinstance(decision.metadata, dict):
+            decision.metadata = {}
+
+        execution_cfg = self.config.get("execution", {}) if isinstance(self.config.get("execution", {}), dict) else {}
+        max_spread = self._finite_optional_float(execution_cfg.get("max_spread"))
+        if max_spread is not None:
+            decision.metadata.setdefault("max_spread_points", max_spread)
+
+        existing = self._entry_spread_from_metadata(decision.metadata)
+        if existing is not None:
+            return existing
+
+        spread_getter = getattr(self.broker, "get_live_spread", None)
+        if not callable(spread_getter):
+            return None
+        try:
+            current_spread = self._finite_optional_float(spread_getter(symbol))
+        except Exception:
+            return None
+        if current_spread is None:
+            return None
+
+        decision.metadata["spread_points"] = current_spread
+        decision.metadata["current_spread"] = current_spread
+        decision.metadata["spread_snapshot_source"] = "broker.get_live_spread"
+        return current_spread
 
     def _trade_opportunity_scanner_config(self) -> Dict[str, Any]:
         scanner_cfg = self.config.get("opportunity_scanner", {})
@@ -2158,6 +2243,7 @@ class TradingRuntime:
                 decision.min_hold_bars = self.execution_churn_guard.enforce_min_hold(
                     decision.min_hold_bars, symbol=symbol
                 )
+                self._annotate_entry_spread_snapshot(symbol=symbol, decision=decision)
 
             reason_text = str(decision.reason or "")
             should_log_decision = not (
@@ -2226,17 +2312,25 @@ class TradingRuntime:
                 decision.metadata["exit_attempt_no"] = int(attempt_count) + 1
 
             if decision.action in {DecisionAction.BUY, DecisionAction.SELL}:
-                spread_getter = getattr(self.broker, "get_live_spread", None)
-                if callable(spread_getter):
-                    current_spread = spread_getter(symbol)
+                current_spread = self._entry_spread_from_metadata(decision.metadata)
+                if current_spread is None:
+                    spread_getter = getattr(self.broker, "get_live_spread", None)
+                    if callable(spread_getter):
+                        try:
+                            current_spread = self._finite_optional_float(spread_getter(symbol))
+                        except Exception:
+                            current_spread = None
+                if current_spread is not None:
                     max_spread = float(self.config.get("execution", {}).get("max_spread", 60.0))
-                    if current_spread is not None and current_spread > max_spread:
+                    if current_spread > max_spread:
                         self.store.append_event(
                             {
                                 "event": "order_skip",
                                 "symbol": symbol,
                                 "strategy": strategy_name,
                                 "reason": f"SPREAD_TOO_HIGH:{current_spread}>{max_spread}",
+                                "current_spread": float(current_spread),
+                                "max_spread_points": float(max_spread),
                             }
                         )
                         self._skip_entry_and_cooldown(
@@ -2331,7 +2425,7 @@ class TradingRuntime:
                             "details": quality_report,
                         }
                     )
-                    self._skip_entry_and_cooldown(
+                    self._skip_entry_without_cooldown(
                         strategy=strategy,
                         symbol=symbol,
                         strategy_name=strategy_name,
@@ -2360,7 +2454,7 @@ class TradingRuntime:
                             "details": edge_report,
                         }
                     )
-                    self._skip_entry_and_cooldown(
+                    self._skip_entry_without_cooldown(
                         strategy=strategy,
                         symbol=symbol,
                         strategy_name=strategy_name,

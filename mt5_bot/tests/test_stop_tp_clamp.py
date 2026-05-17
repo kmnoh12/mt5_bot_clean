@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -182,6 +183,55 @@ class StopTpClampTests(unittest.TestCase):
             self.assertAlmostEqual(float(broker.last_intent.tp or 0.0), 100.5, places=8)
             self.assertTrue(bool(broker.last_intent.metadata.get("stop_adjustment_applied", False)))
 
+    def test_invalid_stop_widening_blocks_when_adjusted_loss_exceeds_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broker = _FakeStopsBroker(anchor_price=100.0)
+            store = JsonStore(
+                state_path=Path(tmpdir) / "state.json",
+                events_path=Path(tmpdir) / "events.jsonl",
+            )
+            manager = OrderManager(
+                broker=broker,
+                store=store,
+                notifier=_NoopNotifier(),
+                execution_cfg={
+                    "default_volume": 0.01,
+                    "max_expected_loss_usd_by_symbol": {"BTCUSD": 0.003},
+                },
+                risk_engine=RiskEngine({"dynamic_lot_enabled": False}),
+                dry_run=False,
+            )
+
+            decision = StrategyDecision(
+                action=DecisionAction.BUY,
+                reason="TEST_BUY_INVALID_STOPS_CAP",
+                strategy="unit",
+                sl=99.8,
+                tp=101.0,
+                metadata={"signal_close": 100.0, "risk_per_unit": 0.2},
+            )
+            result = manager.process_decision(
+                instrument={"symbol": "BTCUSD", "volume": 0.01},
+                decision=decision,
+                current_position=None,
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertFalse(result.ok)
+            self.assertEqual(result.status, "EXPECTED_LOSS_CAP_AFTER_STOP_ADJUSTMENT")
+            self.assertEqual(broker.precheck_calls, 1)
+            self.assertEqual(broker.get_positions("BTCUSD"), [])
+            events = [
+                json.loads(line)
+                for line in (Path(tmpdir) / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(any(
+                event.get("event") == "invalid_stops_adjustment_blocked_by_cap"
+                and event.get("details", {}).get("expected_loss_usd", 0) > 0.003
+                for event in events
+            ))
+
     def test_sell_auto_adjusts_invalid_stops(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             broker = _FakeStopsBroker(anchor_price=100.0)
@@ -225,4 +275,3 @@ class StopTpClampTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

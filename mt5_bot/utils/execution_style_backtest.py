@@ -68,6 +68,10 @@ class SimulatedTrade:
     net_pnl: float
     gross_pnl: float
     cost_usd: float
+    spread_cost_usd: float
+    slippage_cost_usd: float
+    commission_cost_usd: float
+    implementation_shortfall_usd: float
     exit_reason: str
     max_favorable_excursion: float = 0.0
     max_adverse_excursion: float = 0.0
@@ -91,6 +95,10 @@ class _OpenPosition:
     original_sl_price: float
     lot: float
     cost_usd: float
+    spread_cost_usd: float
+    slippage_cost_usd: float
+    commission_cost_usd: float
+    implementation_shortfall_usd: float
     units: float
     max_favorable: float = 0.0
     max_adverse: float = 0.0
@@ -285,6 +293,7 @@ def run_execution_style_backtest(
                     _count_reasons(block_counts, [cap_reason])
                     no_trade_guard.record_rejection(candidate, cap_reason, now_ts=now_ts)
                     continue
+                cost_components = _round_trip_cost_components(float(size.recommended_lot), cfg, spread_price)
                 open_position = _OpenPosition(
                     opportunity=opportunity,
                     direction=direction,
@@ -295,7 +304,11 @@ def run_execution_style_backtest(
                     tp_price=float(opportunity.target_reference_price),
                     original_sl_price=stop,
                     lot=float(size.recommended_lot),
-                    cost_usd=_round_trip_cost(float(size.recommended_lot), cfg, spread_price),
+                    cost_usd=cost_components["total_cost_usd"],
+                    spread_cost_usd=cost_components["spread_cost_usd"],
+                    slippage_cost_usd=cost_components["slippage_cost_usd"],
+                    commission_cost_usd=cost_components["commission_cost_usd"],
+                    implementation_shortfall_usd=cost_components["implementation_shortfall_usd"],
                     units=float(size.recommended_lot) * cfg.contract_size,
                     block_reasons_before_entry=list(decision.reasons) if hasattr(decision, "reasons") else [],
                 )
@@ -465,10 +478,17 @@ def _candidate_from_opportunity(opportunity: Any) -> Dict[str, Any]:
     }
 
 
-def _round_trip_cost(lot: float, cfg: ExecutionStyleBacktestConfig, spread_price: float) -> float:
+def _round_trip_cost_components(lot: float, cfg: ExecutionStyleBacktestConfig, spread_price: float) -> Dict[str, float]:
     spread_cost = (spread_price / cfg.tick_size) * cfg.tick_value * lot if cfg.tick_size > 0 else 0.0
     slippage_cost = cfg.expected_slippage_points * cfg.tick_value * lot
-    return spread_cost + slippage_cost + cfg.commission_per_lot * lot * 2.0
+    commission_cost = cfg.commission_per_lot * lot * 2.0
+    return {
+        "spread_cost_usd": float(spread_cost),
+        "slippage_cost_usd": float(slippage_cost),
+        "commission_cost_usd": float(commission_cost),
+        "implementation_shortfall_usd": float(slippage_cost),
+        "total_cost_usd": float(spread_cost + slippage_cost + commission_cost),
+    }
 
 
 def _leverage_margin_block_reason(
@@ -571,6 +591,10 @@ def _close_position(pos: _OpenPosition, row: Any, idx: int, cfg: ExecutionStyleB
         net_pnl=float(net),
         gross_pnl=float(gross),
         cost_usd=float(pos.cost_usd),
+        spread_cost_usd=float(pos.spread_cost_usd),
+        slippage_cost_usd=float(pos.slippage_cost_usd),
+        commission_cost_usd=float(pos.commission_cost_usd),
+        implementation_shortfall_usd=float(pos.implementation_shortfall_usd),
         exit_reason=reason,
         max_favorable_excursion=float(pos.max_favorable),
         max_adverse_excursion=float(pos.max_adverse),
@@ -618,6 +642,10 @@ def _compute_metrics(
         else:
             consecutive = 0
     per_week = _median_trades_per_week(trades)
+    spread_cost = sum(float(t.spread_cost_usd) for t in trades)
+    slippage_cost = sum(float(t.slippage_cost_usd) for t in trades)
+    commission_cost = sum(float(t.commission_cost_usd) for t in trades)
+    implementation_shortfall = sum(float(t.implementation_shortfall_usd) for t in trades)
     return {
         "total_net_pnl": sum(pnls),
         "profit_factor": gross_profit / gross_loss if gross_loss > 0 else float("inf") if gross_profit > 0 else 0.0,
@@ -643,6 +671,12 @@ def _compute_metrics(
         "winner_capture_ratio": _winner_capture_ratio(trades),
         "profit_lock_sl_moves": sum(t.profit_lock_sl_moves for t in trades),
         "profit_lock_saved_pnl": sum(t.profit_lock_saved_pnl for t in trades),
+        "spread_cost": spread_cost,
+        "slippage_cost": slippage_cost,
+        "commission_cost": commission_cost,
+        "total_cost": spread_cost + slippage_cost + commission_cost,
+        "implementation_shortfall_cost": implementation_shortfall,
+        "implementation_shortfall_per_trade": implementation_shortfall / len(trades) if trades else 0.0,
         "hard_max_respected": all(abs(t.net_pnl) <= cfg.hard_max_net_loss_usd + 1e-9 for t in trades if t.net_pnl < 0),
         "daily_bleed_respected": all(abs(v) <= cfg.max_daily_net_loss_usd + cfg.hard_max_net_loss_usd + 1e-9 for v in daily_pnl.values() if v < 0),
     }
@@ -684,6 +718,10 @@ def _backtest_markdown(result: Dict[str, Any]) -> str:
         "no_trade_days_count",
         "profit_lock_sl_moves",
         "profit_lock_saved_pnl",
+        "spread_cost",
+        "slippage_cost",
+        "commission_cost",
+        "implementation_shortfall_cost",
     ):
         lines.append(f"- {key}: {metrics.get(key)}")
     lines.extend(["", "## Block Reasons"])

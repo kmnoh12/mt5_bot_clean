@@ -61,7 +61,10 @@ def _config(**overrides) -> ExecutionStyleBacktestConfig:
 
 
 def test_execution_style_backtest_tracks_profit_lock_and_risk_metrics() -> None:
-    result = run_execution_style_backtest(_bars_with_profitable_long_setups(), _config())
+    result = run_execution_style_backtest(
+        _bars_with_profitable_long_setups(),
+        _config(spread_points=2.0, commission_per_lot=0.2, expected_slippage_points=1.0),
+    )
     metrics = result["metrics"]
 
     assert metrics["raw_signal_count"] >= 1
@@ -69,8 +72,15 @@ def test_execution_style_backtest_tracks_profit_lock_and_risk_metrics() -> None:
     assert metrics["max_single_trade_loss"] >= -1.25
     assert metrics["hard_max_respected"] is True
     assert "profit_lock_saved_pnl" in metrics
+    assert metrics["spread_cost"] > 0
+    assert metrics["slippage_cost"] > 0
+    assert metrics["commission_cost"] > 0
+    assert metrics["implementation_shortfall_cost"] == metrics["slippage_cost"]
     assert "no_trade_days_count" in metrics
     assert isinstance(result["trades"], list)
+    assert {"spread_cost_usd", "slippage_cost_usd", "commission_cost_usd", "implementation_shortfall_usd"} <= set(
+        result["trades"][0]
+    )
 
 
 def test_execution_style_backtest_blocks_min_lot_when_hard_max_exceeded() -> None:

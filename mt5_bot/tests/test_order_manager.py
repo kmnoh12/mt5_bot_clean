@@ -32,7 +32,12 @@ class _NoopNotifier:
 class _FakeBroker(BrokerGateway):
     mode = "backtest"
 
-    def __init__(self, fail_first_precheck: bool = True, account_currency: str = "USD") -> None:
+    def __init__(
+        self,
+        fail_first_precheck: bool = True,
+        account_currency: str = "USD",
+        live_spread: Optional[float] = None,
+    ) -> None:
         self.precheck_calls = 0
         self.last_intent: Optional[OrderIntent] = None
         self.last_close_volume: Optional[float] = None
@@ -40,6 +45,7 @@ class _FakeBroker(BrokerGateway):
         self.fail_first_precheck = bool(fail_first_precheck)
         self.account_currency = str(account_currency or "USD").upper()
         self.fx_rates: Dict[str, float] = {"USDKRW": 1350.0}
+        self.live_spread = live_spread
 
     def connect(self) -> bool:
         return True
@@ -132,6 +138,9 @@ class _FakeBroker(BrokerGateway):
         value = self.fx_rates.get(str(symbol or "").upper())
         return float(value) if value is not None else None
 
+    def get_live_spread(self, symbol: str) -> Optional[float]:  # noqa: ARG002
+        return self.live_spread
+
 
 class OrderManagerTests(unittest.TestCase):
     def test_dry_run_entry_does_not_call_broker_precheck(self) -> None:
@@ -216,6 +225,54 @@ class OrderManagerTests(unittest.TestCase):
             self.assertIsNotNone(broker.last_intent)
             self.assertIsNotNone(broker.last_intent.sl)
             self.assertIsNotNone(broker.last_intent.tp)
+
+    def test_entry_metadata_records_live_spread_snapshot_for_postmortems(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broker = _FakeBroker(fail_first_precheck=False, live_spread=17.0)
+            store = JsonStore(
+                state_path=Path(tmpdir) / "state.json",
+                events_path=Path(tmpdir) / "events.jsonl",
+            )
+            risk = RiskEngine(
+                {
+                    "risk_per_trade_pct": 0.015,
+                    "daily_loss_limit_pct": 0.06,
+                    "session_loss_limit_pct": 0.12,
+                    "max_consecutive_losses": 5,
+                }
+            )
+            manager = OrderManager(
+                broker=broker,
+                store=store,
+                notifier=_NoopNotifier(),
+                execution_cfg={"default_volume": 0.1, "max_spread": 1200},
+                risk_engine=risk,
+                dry_run=False,
+            )
+
+            decision = StrategyDecision(
+                action=DecisionAction.SELL,
+                reason="TEST_ENTRY_SPREAD_SNAPSHOT",
+                strategy="liquidity_sweep_reversal",
+                sl=101.0,
+                tp=98.0,
+                metadata={"signal_close": 100.0},
+            )
+            result = manager.process_decision(
+                instrument={"symbol": "BTCUSD", "volume": 0.2},
+                decision=decision,
+                current_position=None,
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertTrue(result.ok)
+            self.assertIsNotNone(broker.last_intent)
+            assert broker.last_intent is not None
+            self.assertEqual(broker.last_intent.metadata["spread_points"], 17.0)
+            self.assertEqual(broker.last_intent.metadata["current_spread"], 17.0)
+            self.assertEqual(broker.last_intent.metadata["max_spread_points"], 1200.0)
+            self.assertEqual(broker.last_intent.metadata["spread_snapshot_source"], "broker.get_live_spread")
 
     def test_entry_allows_none_tp(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

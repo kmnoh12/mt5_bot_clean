@@ -56,6 +56,9 @@ class _FakeBroker:
     def account_info(self):
         return {"equity": 10000.0, "balance": 10000.0}
 
+    def get_live_spread(self, symbol: str):  # noqa: ARG002
+        return 17.0
+
 
 class _StatefulPendingStrategy:
     enabled = True
@@ -133,6 +136,21 @@ class _NoopEntryQualityGuard:
     @staticmethod
     def evaluate_entry(*args, **kwargs):  # noqa: ARG002
         return {"allow": True}
+
+    @staticmethod
+    def snapshot():
+        return {}
+
+
+class _BlockingEntryQualityGuard:
+    @staticmethod
+    def evaluate_entry(*args, **kwargs):  # noqa: ARG002
+        return {
+            "allow": False,
+            "reason": "ENTRY_QUALITY_BLOCK",
+            "score": 0.2,
+            "threshold": 0.25,
+        }
 
     @staticmethod
     def snapshot():
@@ -314,6 +332,81 @@ class RuntimeEntrySkipStateTests(unittest.TestCase):
         skip_events = [event for event in runtime.store.events if event.get("event") == "order_skip"]
         self.assertEqual(skip_events[0].get("reason"), "M5_CONFIRM_BLOCK")
         self.assertEqual(skip_events[0].get("m5_confirm", {}).get("reason"), "UNIT_TEST_M5_BLOCK")
+        decision_events = [event for event in runtime.store.events if event.get("event") == "decision"]
+        self.assertEqual(decision_events[0].get("metadata", {}).get("current_spread"), 17.0)
+        self.assertEqual(decision_events[0].get("metadata", {}).get("spread_points"), 17.0)
+        self.assertEqual(
+            decision_events[0].get("metadata", {}).get("spread_snapshot_source"),
+            "broker.get_live_spread",
+        )
+
+    def test_entry_quality_rejection_clears_pending_without_cooldown(self) -> None:
+        runtime = TradingRuntime.__new__(TradingRuntime)
+        strategy = _StatefulPendingStrategy()
+        runtime.broker = _FakeBroker()
+        runtime.config = {"universe": [{"symbol": "BTCUSD", "strategy": "entry_skip", "timeframe": "TIMEFRAME_M1"}]}
+        runtime.strategies = {"entry_skip": strategy}
+        runtime.store = _FakeStore()
+        runtime.state = {}
+        runtime.mode = BotMode.LIVE
+        runtime.dashboard_enabled = False
+        runtime.control_channel = None
+        runtime.bar_gate = SimpleNamespace(should_evaluate=lambda symbol, bars: (True, None))
+        runtime.lifecycle = _FakeLifecycle()
+        runtime.notifier = _FakeNotifier()
+        runtime.manual_position_guard = _FakeManualPositionGuard()
+        runtime.risk_engine = _FakeRiskEngine()
+        runtime.exit_engine = _NoopExitEngine()
+        runtime.execution_churn_guard = _NoopChurnGuard()
+        runtime.entry_quality_guard = _BlockingEntryQualityGuard()
+        runtime.cost_edge_guard = _NoopCostEdgeGuard()
+        runtime.exit_quality_guard = _NoopExitQualityGuard()
+        runtime.exit_retry_guard = _NoopExitRetryGuard()
+        runtime.mtf_confirm = SimpleNamespace(is_symbol_enabled=lambda symbol: False)
+        runtime.order_manager = _FakeOrderManager()
+        runtime.trailing_guard = _NoopTrailingGuard()
+        runtime._halt_for_broker_fatal = lambda: False
+        runtime._reload_config_if_changed = lambda: None
+        runtime._run_heartbeat = lambda: None
+        runtime._reconcile_strategy_states = lambda broker_positions: None
+        runtime._reset_strategy_state_for_protected_symbol = lambda symbol: None
+        runtime._run_pending_protection_cycle = lambda broker_positions, excluded_symbols: set()
+        runtime._consume_manual_entry_request = lambda ctrl: False
+        runtime._run_auto_tuning_cycle = lambda bars_by_symbol: None
+        runtime._save_runtime_state = lambda: None
+        runtime._refresh_daily_reference_levels = lambda: None
+        runtime._write_watchdog_heartbeat = lambda: None
+        runtime._write_v4_opportunity_reports = lambda: None
+        runtime._protection_blocked_symbols = set()
+        runtime._pending_protection_updates = {}
+        runtime._daily_reference_cache = {}
+        runtime._daily_reference_refresh_interval_seconds = 3600.0
+        runtime._last_daily_reference_refresh_ts = time.time()
+        runtime._active_symbols = ["BTCUSD"]
+        runtime._last_risk_guard_reason = ""
+        runtime.bars_per_request = 20
+        runtime._last_heartbeat_ts = 0.0
+        runtime._watchdog_heartbeat_path = None
+
+        state = strategy.get_symbol_state("BTCUSD")
+        state.state = StrategyState.ENTRY_PENDING
+        state.pending_order = True
+        state.cooldown_bars_remaining = 0
+
+        runtime.run_cycle()
+
+        updated = strategy.get_symbol_state("BTCUSD")
+        self.assertEqual(updated.state, StrategyState.IDLE)
+        self.assertFalse(updated.pending_order)
+        self.assertEqual(updated.cooldown_bars_remaining, 0)
+        self.assertEqual(updated.last_reason, "ENTRY_QUALITY_BLOCK")
+        self.assertFalse(any(event.get("event") == "strategy_state_forced_cooldown" for event in runtime.store.events))
+        self.assertTrue(any(
+            event.get("event") == "rejected_setup_no_trade"
+            and event.get("reason") == "ENTRY_QUALITY_BLOCK"
+            and event.get("cooldown_applied") is False
+            for event in runtime.store.events
+        ))
 
 
 if __name__ == "__main__":

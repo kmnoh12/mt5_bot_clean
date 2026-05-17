@@ -167,6 +167,20 @@ class LiquiditySweepReversalStrategyTests(unittest.TestCase):
         self.assertIn("volume_scale", entry.metadata)
         self.assertGreater(float(entry.metadata["expected_rr"]), 1.0)
         self.assertGreater(float(entry.metadata["win_probability"]), 0.0)
+        self.assertEqual(entry.metadata["reclaim_quality"]["confirmation_path"], "reclaim_only")
+        self.assertFalse(entry.metadata["reclaim_quality"]["retest_confirmed"])
+        self.assertEqual(entry.metadata["lsr_confirmation_flags"]["review_bucket"], "unconfirmed_reclaim_chase")
+        self.assertTrue(entry.metadata["lsr_confirmation_flags"]["lsr_unconfirmed_reclaim"])
+        self.assertTrue(entry.metadata["lsr_confirmation_flags"]["weak_reclaim_after_deep_sweep"])
+        self.assertIn("confirmation_score", entry.metadata["lsr_confirmation_flags"])
+        self.assertEqual(
+            entry.metadata["reclaim_quality"]["confirmation_flags"]["confirmation_score"],
+            entry.metadata["lsr_confirmation_flags"]["confirmation_score"],
+        )
+        self.assertGreaterEqual(float(entry.metadata["time_from_sweep_to_reclaim_sec"]), 0.0)
+        self.assertGreater(float(entry.metadata["reclaim_quality"]["reclaim_distance_atr"]), 0.0)
+        self.assertGreater(float(entry.metadata["reclaim_quality"]["sweep_depth_atr"]), 0.0)
+        self.assertIsNotNone(entry.metadata.get("signal_reclaim_time_utc"))
 
     def test_blocks_reentry_for_same_sweep_event_key(self) -> None:
         strategy = self._build_strategy()

@@ -21,6 +21,7 @@ from core.models import (
 )
 from strategies.base import LOGGER, BaseStateMachineStrategy
 from utils.indicators import compute_atr, sanitize_ohlc
+from utils.liquidity import classify_lsr_confirmation_quality
 
 
 @dataclass
@@ -894,12 +895,53 @@ class LiquiditySweepReversalTickStrategy(BaseStateMachineStrategy):
             self._transition(st, StrategyState.ENTRY_PENDING, "RECLAIM_DISPLACEMENT_ENTRY")
 
             signal_time = st.last_closed_bar_time or now_dt
+            if setup.side == Side.SELL:
+                reclaim_distance = float(setup.level) - float(entry_price)
+                sweep_depth = float(setup.extreme) - float(setup.level)
+            else:
+                reclaim_distance = float(entry_price) - float(setup.level)
+                sweep_depth = float(setup.level) - float(setup.extreme)
+            reclaim_distance = max(0.0, float(reclaim_distance))
+            sweep_depth = max(0.0, float(sweep_depth))
+            time_from_sweep_to_reclaim_sec = max(0.0, float(elapsed_ms / 1000.0))
+            reclaim_quality = {
+                "confirmation_path": "tick_reclaim",
+                "retest_confirmed": False,
+                "time_from_sweep_to_reclaim_sec": float(time_from_sweep_to_reclaim_sec),
+                "reclaim_window_sec": int(setup.reclaim_window_sec),
+                "reclaim_distance": float(reclaim_distance),
+                "reclaim_distance_atr": float(reclaim_distance / atr) if atr > 0.0 else None,
+                "sweep_depth": float(sweep_depth),
+                "sweep_depth_atr": float(sweep_depth / atr) if atr > 0.0 else None,
+                "reclaim_to_sweep_depth_ratio": (
+                    float(reclaim_distance / sweep_depth) if sweep_depth > 0.0 else None
+                ),
+                "sweep_velocity": float(sweep_velocity),
+                "reclaim_velocity": float(reclaim_velocity),
+                "reclaim_accel_ratio": float(reclaim_accel_ratio),
+                "reclaim_accel_ratio_min": float(accel_ratio_min),
+            }
+            confirmation_flags = classify_lsr_confirmation_quality(
+                confirmation_path=reclaim_quality.get("confirmation_path"),
+                retest_confirmed=False,
+                reclaim_distance_atr=reclaim_quality.get("reclaim_distance_atr"),
+                sweep_depth_atr=reclaim_quality.get("sweep_depth_atr"),
+                reclaim_to_sweep_depth_ratio=reclaim_quality.get("reclaim_to_sweep_depth_ratio"),
+                displacement_ratio=disp_ratio,
+                time_from_sweep_to_reclaim_sec=reclaim_quality.get("time_from_sweep_to_reclaim_sec"),
+                reclaim_window_sec=reclaim_quality.get("reclaim_window_sec"),
+                is_lsr=True,
+            )
+            reclaim_quality["confirmation_flags"] = confirmation_flags
             entry_metadata = {
                 "sweep_level": float(setup.level),
                 "sweep_level_name": setup.level_name,
                 "sweep_extreme": float(setup.extreme),
                 "sweep_time_utc": datetime.fromtimestamp(setup.sweep_time_ms / 1000.0, tz=timezone.utc).isoformat(),
                 "reclaim_time_utc": now_dt.isoformat(),
+                "time_from_sweep_to_reclaim_sec": float(time_from_sweep_to_reclaim_sec),
+                "reclaim_quality": reclaim_quality,
+                "lsr_confirmation_flags": confirmation_flags,
                 "reclaim_window_sec": int(setup.reclaim_window_sec),
                 "reclaim_extension_sec": int(setup.reclaim_extension_sec),
                 "reclaim_extended": bool(setup.extended),

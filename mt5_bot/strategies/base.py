@@ -257,6 +257,19 @@ class BaseStateMachineStrategy(ABC):
                 self._transition(st, StrategyState.HALTED, "ENTRY_REJECTED_10027")
                 return
 
+            status = str(getattr(result, "status", "") or "").strip().upper() if result is not None else ""
+            no_trade_statuses = {
+                "ENTRY_QUALITY_BLOCK",
+                "EDGE_TOO_LOW",
+                "EXPECTED_LOSS_CAP",
+                "EXPECTED_LOSS_CAP_AFTER_STOP_ADJUSTMENT",
+                "RISK_PLAN_FAILED",
+                "CHECK_REJECTED",
+            }
+            if status in no_trade_statuses:
+                self.mark_entry_rejected_no_trade(symbol=symbol, reason=status or "ENTRY_REJECTED_NO_TRADE")
+                return
+
             st.cooldown_bars_remaining = self.min_cooldown_bars
             self._transition(st, StrategyState.COOLDOWN, "ENTRY_FAILED")
             return
@@ -276,6 +289,16 @@ class BaseStateMachineStrategy(ABC):
                 st.metadata["last_manage_bar_time"] = ""
                 self._transition(st, StrategyState.COOLDOWN, "EXIT_FILLED")
             return
+
+    def mark_entry_rejected_no_trade(self, symbol: str, reason: str) -> None:
+        st = self._symbol_state(symbol)
+        st.pending_order = False
+        st.cooldown_bars_remaining = max(0, int(st.cooldown_bars_remaining or 0))
+        if st.state == StrategyState.ENTRY_PENDING:
+            self._transition(st, StrategyState.IDLE, str(reason or "ENTRY_REJECTED_NO_TRADE"))
+            return
+        st.last_reason = str(reason or "ENTRY_REJECTED_NO_TRADE")
+        st.updated_at_utc = datetime.now(timezone.utc)
 
     def evaluate(
         self,

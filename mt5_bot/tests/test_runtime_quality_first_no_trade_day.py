@@ -5,6 +5,34 @@ from execution.entry_quality_guard import EntryQualityGuard
 
 
 class RuntimeQualityFirstNoTradeDayTests(unittest.TestCase):
+    def test_risk_off_score_equal_to_threshold_passes(self) -> None:
+        guard = EntryQualityGuard(
+            {
+                "enabled": True,
+                "min_score": 0.2,
+                "min_score_risk_off": 0.2,
+                "min_score_risk_on": 0.2,
+            },
+            snapshot={"closed_trades": [{"symbol": "BTCUSD", "pnl": -1.15, "hold_seconds": 0.0}]},
+        )
+        out = guard.evaluate_entry(
+            symbol="BTCUSD",
+            decision_action=DecisionAction.BUY,
+            decision_metadata={
+                "entry_style": "liquidity_sweep_reversal",
+                "indicator_snapshot": {
+                    "trend_strength": 0.0,
+                    "adx_norm": 0.0,
+                    "ema_gap_atr": 0.0,
+                },
+            },
+            m5_aligned=True,
+        )
+        self.assertTrue(out["allow"])
+        self.assertEqual(out["reason"], "OK")
+        self.assertAlmostEqual(out["score"], 0.2)
+        self.assertAlmostEqual(out["threshold"], 0.2)
+
     def test_quality_first_can_block_all_entries(self) -> None:
         guard = EntryQualityGuard(
             {

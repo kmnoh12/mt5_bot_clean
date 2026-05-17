@@ -7,7 +7,10 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
-import pandas as pd
+try:
+    import pandas as pd
+except ModuleNotFoundError:  # pragma: no cover - dependency checked at runtime for data loads
+    pd = None  # type: ignore[assignment]
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -53,6 +56,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--slippage-points", type=float, default=0.0)
     parser.add_argument("--min-total-trades", type=int, default=100)
     parser.add_argument("--min-oos-trades", type=int, default=100)
+    parser.add_argument("--min-oos-trade-share-pct", type=float, default=20.0)
+    parser.add_argument("--min-oos-trading-days", type=int, default=3)
+    parser.add_argument("--min-oos-trades-per-symbol", type=int, default=20)
+    parser.add_argument("--min-oos-trading-days-per-symbol", type=int, default=1)
+    parser.add_argument("--min-oos-trades-per-direction", type=int, default=0)
     parser.add_argument("--min-oos-profit-factor", type=float, default=1.05)
     parser.add_argument("--min-oos-expectancy-net", type=float, default=0.0)
     parser.add_argument("--max-no-trade-days-pct", type=float, default=60.0)
@@ -103,6 +111,7 @@ def _run_trial(
     train_items: List[Dict[str, Any]] = []
     oos_items: List[Dict[str, Any]] = []
     symbol_metrics: Dict[str, Dict[str, Any]] = {}
+    oos_trades_by_symbol: Dict[str, List[Mapping[str, Any]]] = {}
     for symbol, frame in frames.items():
         train_frame, oos_frame = _date_or_ratio_split(frame, args)
         cfg = _backtest_config(symbol, config, args)
@@ -140,13 +149,23 @@ def _run_trial(
         train_items.append(train_metrics)
         oos_items.append(oos_metrics)
         symbol_metrics[symbol] = {"train": train_metrics, "oos": oos_metrics}
+        oos_trades_by_symbol[symbol] = [
+            trade for trade in list(oos_result.get("trades", []) or []) if isinstance(trade, Mapping)
+        ]
     train_agg = aggregate_metrics(train_items)
     oos_agg = aggregate_metrics(oos_items)
     metrics = attach_oos_metrics(train_agg, oos_agg)
+    metrics.update(_symbol_oos_coverage_metrics(symbol_metrics))
+    metrics.update(_oos_direction_coverage_metrics(oos_trades_by_symbol))
     config_with_validation = dict(config)
     config_with_validation["validation"] = {
         "min_total_trades": int(args.min_total_trades),
         "min_oos_trades": int(args.min_oos_trades),
+        "min_oos_trade_share_pct": float(args.min_oos_trade_share_pct),
+        "min_oos_trading_days": int(args.min_oos_trading_days),
+        "min_oos_trades_per_symbol": int(args.min_oos_trades_per_symbol),
+        "min_oos_trading_days_per_symbol": int(args.min_oos_trading_days_per_symbol),
+        "min_oos_trades_per_direction": int(args.min_oos_trades_per_direction),
         "min_oos_profit_factor": float(args.min_oos_profit_factor),
         "min_oos_expectancy_net": float(args.min_oos_expectancy_net),
         "max_no_trade_days_pct": float(args.max_no_trade_days_pct),
@@ -220,7 +239,58 @@ def _write_outputs(
     _write_markdown(out_dir / "optimization_v4_oos_verdict.md", _oos_verdict_md(trials, frontier, recommendations, args))
     rec_payload = {name: trial.to_dict() if trial else None for name, trial in recommendations.items()}
     _write_json(out_dir / "recommended_configs_v4.json", rec_payload)
+    _write_json(out_dir / "recommended_configs_v4_promotion_gate.json", _promotion_gate_payload(recommendations, args))
     _write_markdown(out_dir / "recommended_configs_v4.md", _recommendations_md(recommendations))
+
+
+def _symbol_oos_coverage_metrics(symbol_metrics: Mapping[str, Mapping[str, Any]]) -> Dict[str, Any]:
+    oos_trade_counts: Dict[str, int] = {}
+    oos_day_counts: Dict[str, int] = {}
+    for symbol, payload in symbol_metrics.items():
+        if not isinstance(payload, Mapping):
+            continue
+        oos = payload.get("oos")
+        if not isinstance(oos, Mapping):
+            continue
+        trade_count = int(oos.get("total_trades", 0) or 0)
+        day_count = int(oos.get("trading_day_count", 0) or 0)
+        oos_trade_counts[str(symbol)] = trade_count
+        oos_day_counts[str(symbol)] = day_count
+    return {
+        "oos_symbol_count": len(oos_trade_counts),
+        "oos_symbol_trade_counts": oos_trade_counts,
+        "oos_symbol_trading_day_counts": oos_day_counts,
+        "oos_min_symbol_trades": min(oos_trade_counts.values(), default=0),
+        "oos_min_symbol_trading_days": min(oos_day_counts.values(), default=0),
+        "oos_symbols_with_no_trades": sorted(symbol for symbol, count in oos_trade_counts.items() if count <= 0),
+    }
+
+
+def _oos_direction_coverage_metrics(oos_trades_by_symbol: Mapping[str, Iterable[Mapping[str, Any]]]) -> Dict[str, Any]:
+    counts = {"long": 0, "short": 0}
+    symbol_counts: Dict[str, Dict[str, int]] = {}
+    for symbol, trades in oos_trades_by_symbol.items():
+        per_symbol = {"long": 0, "short": 0}
+        for trade in trades:
+            raw_direction = str(trade.get("direction", "")).strip().lower()
+            if raw_direction in {"buy", "bull", "long"}:
+                direction = "long"
+            elif raw_direction in {"sell", "bear", "short"}:
+                direction = "short"
+            else:
+                continue
+            counts[direction] += 1
+            per_symbol[direction] += 1
+        symbol_counts[str(symbol)] = per_symbol
+    total = counts["long"] + counts["short"]
+    imbalance_pct = (max(counts.values()) / total * 100.0) if total else 0.0
+    return {
+        "oos_direction_trade_counts": counts,
+        "oos_symbol_direction_trade_counts": symbol_counts,
+        "oos_min_direction_trades": min(counts.values()) if total else 0,
+        "oos_single_direction_only": bool(total and min(counts.values()) == 0),
+        "oos_direction_imbalance_pct": imbalance_pct,
+    }
 
 
 def _write_preflight_reports(out_dir: Path, symbols: List[str], frames: Mapping[str, pd.DataFrame], trials: List[TrialResult]) -> None:
@@ -341,6 +411,11 @@ def _oos_verdict_md(
         "",
         "## 6. hard reject 조건",
         "- hard max loss breach, daily loss breach, no-trade, OOS PF/expectancy/trade count, leverage/margin cap",
+        f"- OOS trade share floor: {args.min_oos_trade_share_pct:.2f}%",
+        f"- OOS trading-day floor: {args.min_oos_trading_days}",
+        f"- per-symbol OOS trade floor: {args.min_oos_trades_per_symbol}",
+        f"- per-symbol OOS trading-day floor: {args.min_oos_trading_days_per_symbol}",
+        f"- per-direction OOS trade floor: {args.min_oos_trades_per_direction}",
         "",
         "## 7. 전체 trial 결과 요약",
         f"- accepted={sum(1 for t in trials if not t.rejected)}",
@@ -396,7 +471,13 @@ def _oos_verdict_md(
 
 
 def _recommendations_md(recommendations: Mapping[str, Optional[TrialResult]]) -> str:
-    lines = ["# Recommended Configs v4", "", "- live 적용 금지: paper forward 검증 후보입니다.", ""]
+    lines = [
+        "# Recommended Configs v4",
+        "",
+        "- live 적용 금지: paper forward 검증 후보입니다.",
+        "- machine-readable gate: recommended_configs_v4_promotion_gate.json",
+        "",
+    ]
     for name in ("aggressive", "balanced", "conservative"):
         lines.append(f"## {name}")
         lines.append(_recommendation_block(name, recommendations.get(name)))
@@ -419,8 +500,19 @@ def _recommendation_block(name: str, trial: Optional[TrialResult]) -> str:
             f"- max_drawdown_pct: {m.get('max_drawdown_pct')}",
             f"- no_trade_days_pct: {m.get('no_trade_days_pct')}",
             f"- oos_total_trades: {m.get('oos_total_trades')}",
+            f"- oos_trading_day_count: {m.get('oos_trading_day_count')}",
+            f"- oos_trade_share_pct: {m.get('oos_trade_share_pct')}",
+            f"- oos_min_symbol_trades: {m.get('oos_min_symbol_trades')}",
+            f"- oos_min_symbol_trading_days: {m.get('oos_min_symbol_trading_days')}",
+            f"- oos_direction_trade_counts: {m.get('oos_direction_trade_counts')}",
+            f"- oos_min_direction_trades: {m.get('oos_min_direction_trades')}",
             f"- oos_net_profit_factor: {m.get('oos_net_profit_factor')}",
             f"- oos_expectancy_net: {m.get('oos_expectancy_net')}",
+            f"- signal_gross_expectancy: {m.get('signal_gross_expectancy')}",
+            f"- expectancy_net: {m.get('expectancy_net')}",
+            f"- cost_drag_per_trade: {m.get('cost_drag_per_trade')}",
+            f"- implementation_shortfall_per_trade: {m.get('implementation_shortfall_per_trade')}",
+            f"- gross_positive_net_nonpositive_rate: {m.get('gross_positive_net_nonpositive_rate')}",
             f"- effective_leverage_max: {m.get('effective_leverage_max')}",
             f"- margin_used_pct_max: {m.get('margin_used_pct_max')}",
             "",
@@ -431,14 +523,80 @@ def _recommendation_block(name: str, trial: Optional[TrialResult]) -> str:
     )
 
 
+def _promotion_gate_payload(
+    recommendations: Mapping[str, Optional[TrialResult]],
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    required_blockers = ["walk_forward_stage_missing", "shadow_stage_missing"]
+    gates: Dict[str, Any] = {}
+    for name in ("aggressive", "balanced", "conservative"):
+        trial = recommendations.get(name)
+        block_reasons = list(required_blockers)
+        if trial is None:
+            block_reasons.insert(0, "recommendation_missing")
+        elif trial.rejected:
+            block_reasons.insert(0, "optimizer_hard_reject")
+        gates[name] = {
+            "trial_id": trial.trial_id if trial else None,
+            "status": "blocked",
+            "live_promotion_allowed": False,
+            "stage": "paper_forward_only",
+            "block_reasons": block_reasons,
+            "required_evidence": [
+                "accepted_optimizer_trial",
+                "walk_forward_windows_or_folds",
+                "oos_sample_floor",
+                "shadow_promotion_gate_pass",
+            ],
+            "observed": {
+                "optimizer_rejected": bool(trial.rejected) if trial else None,
+                "oos_total_trades": trial.metrics.get("oos_total_trades") if trial else None,
+                "oos_trading_day_count": trial.metrics.get("oos_trading_day_count") if trial else None,
+                "oos_trade_share_pct": trial.metrics.get("oos_trade_share_pct") if trial else None,
+                "oos_min_symbol_trades": trial.metrics.get("oos_min_symbol_trades") if trial else None,
+                "oos_min_direction_trades": trial.metrics.get("oos_min_direction_trades") if trial else None,
+            },
+        }
+    return {
+        "schema": "optimizer_v4_promotion_gate",
+        "live_promotion_allowed": False,
+        "status": "blocked",
+        "stage": "paper_forward_only",
+        "block_reasons": required_blockers,
+        "policy": (
+            "Offline optimizer recommendations are not live configs. "
+            "Attach walk-forward/OOS window evidence and a passing shadow promotion gate before live review."
+        ),
+        "thresholds": {
+            "min_oos_trades": int(args.min_oos_trades),
+            "min_oos_trading_days": int(args.min_oos_trading_days),
+            "min_oos_trades_per_symbol": int(args.min_oos_trades_per_symbol),
+            "min_oos_trading_days_per_symbol": int(args.min_oos_trading_days_per_symbol),
+            "min_oos_trades_per_direction": int(args.min_oos_trades_per_direction),
+            "min_oos_trade_share_pct": float(args.min_oos_trade_share_pct),
+            "min_oos_profit_factor": float(args.min_oos_profit_factor),
+            "min_oos_expectancy_net": float(args.min_oos_expectancy_net),
+        },
+        "recommendations": gates,
+    }
+
+
 def _trial_line(trial: TrialResult) -> str:
     m = trial.metrics
     return (
         f"- trial={trial.trial_id} rejected={trial.rejected} score={trial.robust_score:.4f} "
         f"pnl={float(m.get('total_net_pnl', 0.0) or 0.0):.4f} "
         f"pf={float(m.get('net_profit_factor', 0.0) or 0.0):.4f} "
+        f"gross_exp={float(m.get('signal_gross_expectancy', 0.0) or 0.0):.4f} "
+        f"net_exp={float(m.get('expectancy_net', 0.0) or 0.0):.4f} "
+        f"shortfall/trade={float(m.get('implementation_shortfall_per_trade', 0.0) or 0.0):.4f} "
         f"trades={int(m.get('total_trades', 0) or 0)} "
         f"oos_trades={int(m.get('oos_total_trades', 0) or 0)} "
+        f"oos_days={int(m.get('oos_trading_day_count', 0) or 0)} "
+        f"oos_share={float(m.get('oos_trade_share_pct', 0.0) or 0.0):.2f}% "
+        f"oos_min_sym_trades={int(m.get('oos_min_symbol_trades', 0) or 0)} "
+        f"oos_min_sym_days={int(m.get('oos_min_symbol_trading_days', 0) or 0)} "
+        f"oos_min_dir_trades={int(m.get('oos_min_direction_trades', 0) or 0)} "
         f"no_trade={float(m.get('no_trade_days_pct', 0.0) or 0.0):.2f}% "
         f"eff_lev={float(m.get('effective_leverage_max', 0.0) or 0.0):.4f} "
         f"margin={float(m.get('margin_used_pct_max', 0.0) or 0.0):.4f}% "
@@ -455,6 +613,8 @@ def _trial_configs(mode: str, trials: int, seed: int) -> List[Dict[str, Any]]:
 
 
 def _load_frames(data_dir: Path, symbols: List[str], max_rows: int) -> Dict[str, pd.DataFrame]:
+    if pd is None:
+        raise RuntimeError("pandas is required to load optimizer CSV data")
     frames: Dict[str, pd.DataFrame] = {}
     for symbol in symbols:
         path = _find_csv(data_dir, symbol)

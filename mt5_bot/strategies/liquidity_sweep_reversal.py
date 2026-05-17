@@ -11,6 +11,7 @@ import pandas as pd
 from core.models import DecisionAction, OrderResult, Position, Side, StrategyDecision, StrategyState, StrategySymbolState
 from strategies.base import BaseStateMachineStrategy
 from utils.indicators import compute_adx, compute_atr, compute_ema, parse_bar_time, sanitize_ohlc
+from utils.liquidity import classify_lsr_confirmation_quality
 
 
 class LiquiditySweepReversalStrategy(BaseStateMachineStrategy):
@@ -1094,6 +1095,9 @@ class LiquiditySweepReversalStrategy(BaseStateMachineStrategy):
                         "level": float(retest_level),
                         "extreme": float(updated_extreme),
                         "sweep_time": retest_sweep_time if isinstance(retest_sweep_time, datetime) else sweep_time,
+                        "confirmation_path": "retest",
+                        "retest_confirmed": True,
+                        "retest_age_bars": int(retest_age_bars),
                     },
                     displacement_ratio=displacement_ratio,
                     atr_regime_ratio=atr_regime_ratio,
@@ -1445,6 +1449,19 @@ class LiquiditySweepReversalStrategy(BaseStateMachineStrategy):
                     )
 
         weekend_profile_applied = weekend_profile.get("applied") is True
+        trend_regime = risk_context.get("trend_regime", {}) if isinstance(risk_context.get("trend_regime"), dict) else {}
+        trend_direction = str(trend_regime.get("direction", "UNKNOWN") or "UNKNOWN").upper()
+        trend_aligned = (side == Side.BUY and trend_direction == "UP") or (side == Side.SELL and trend_direction == "DOWN")
+        trend_counter = (side == Side.BUY and trend_direction == "DOWN") or (side == Side.SELL and trend_direction == "UP")
+        if bool(trend_regime.get("enabled", False)) and trend_counter:
+            return self._hold(
+                "LSR_TREND_REGIME_COUNTERTREND_BLOCK",
+                {
+                    "side": side.value,
+                    "trend_direction": trend_direction,
+                    "trend_regime": dict(trend_regime),
+                },
+            )
         adx_threshold = 25.0 if weekend_profile_applied else 20.0
         adx = self._finite_float(risk_context.get("adx"))
         if adx is not None and adx < adx_threshold:
@@ -1472,7 +1489,13 @@ class LiquiditySweepReversalStrategy(BaseStateMachineStrategy):
         risk_hints["volume_scale"] = float(max(0.0, risk_hints["volume_scale"] * weekend_k_risk))
 
         weekend_k_sl_mult = float(weekend_profile.get("k_sl_mult", 1.0))
-        effective_sl_mult = self.sl_atr_mult * max(1.0, weekend_k_sl_mult)
+        regime_stop_width_mult = 1.0
+        if trend_aligned:
+            regime_stop_width_mult = 1.15
+        elif trend_direction == "RANGE":
+            regime_stop_width_mult = 1.05
+        effective_sl_mult = self.sl_atr_mult * max(1.0, weekend_k_sl_mult) * regime_stop_width_mult
+        risk_hints["volume_scale"] = float(max(0.0, risk_hints["volume_scale"] / regime_stop_width_mult))
 
         if side == Side.BUY:
             structural_sl = min(extreme, close_price - (atr * effective_sl_mult)) - (atr * self.stop_buffer_atr)
@@ -1524,6 +1547,43 @@ class LiquiditySweepReversalStrategy(BaseStateMachineStrategy):
             weekend_profile.get("t_reversion_sec", effective_reclaim_window_sec),
             effective_reclaim_window_sec,
         )
+        time_from_sweep_to_reclaim_sec = None
+        if sweep_time is not None and signal_bar_time is not None:
+            time_from_sweep_to_reclaim_sec = max(0.0, (signal_bar_time - sweep_time).total_seconds())
+        if side == Side.BUY:
+            reclaim_distance = float(close_price - level)
+            sweep_depth = float(level - extreme)
+        else:
+            reclaim_distance = float(level - close_price)
+            sweep_depth = float(extreme - level)
+        reclaim_distance = max(0.0, reclaim_distance)
+        sweep_depth = max(0.0, sweep_depth)
+        reclaim_quality = {
+            "confirmation_path": str(pending.get("confirmation_path") or "reclaim_only"),
+            "retest_confirmed": bool(pending.get("retest_confirmed", False)),
+            "retest_age_bars": self._to_int(pending.get("retest_age_bars"), 0),
+            "time_from_sweep_to_reclaim_sec": time_from_sweep_to_reclaim_sec,
+            "reclaim_window_sec": int(max(1, effective_reclaim_window_sec)),
+            "reclaim_distance": float(reclaim_distance),
+            "reclaim_distance_atr": float(reclaim_distance / atr) if atr > 0.0 else None,
+            "sweep_depth": float(sweep_depth),
+            "sweep_depth_atr": float(sweep_depth / atr) if atr > 0.0 else None,
+            "reclaim_to_sweep_depth_ratio": (
+                float(reclaim_distance / sweep_depth) if sweep_depth > 0.0 else None
+            ),
+        }
+        confirmation_flags = classify_lsr_confirmation_quality(
+            confirmation_path=reclaim_quality.get("confirmation_path"),
+            retest_confirmed=bool(reclaim_quality.get("retest_confirmed", False)),
+            reclaim_distance_atr=reclaim_quality.get("reclaim_distance_atr"),
+            sweep_depth_atr=reclaim_quality.get("sweep_depth_atr"),
+            reclaim_to_sweep_depth_ratio=reclaim_quality.get("reclaim_to_sweep_depth_ratio"),
+            displacement_ratio=displacement_ratio,
+            time_from_sweep_to_reclaim_sec=reclaim_quality.get("time_from_sweep_to_reclaim_sec"),
+            reclaim_window_sec=reclaim_quality.get("reclaim_window_sec"),
+            is_lsr=True,
+        )
+        reclaim_quality["confirmation_flags"] = confirmation_flags
 
         entry_metadata: Dict[str, Any] = {
             "entry_style": "liquidity_sweep_reversal",
@@ -1532,6 +1592,10 @@ class LiquiditySweepReversalStrategy(BaseStateMachineStrategy):
             "sweep_level": float(level),
             "sweep_extreme": float(extreme),
             "sweep_event_key": sweep_event_key,
+            "signal_reclaim_time_utc": signal_bar_time.isoformat() if signal_bar_time is not None else None,
+            "time_from_sweep_to_reclaim_sec": time_from_sweep_to_reclaim_sec,
+            "reclaim_quality": reclaim_quality,
+            "lsr_confirmation_flags": confirmation_flags,
             "stage_a_target": float(stage_a_target),
             "tp_r1": float(self.tp_r1),
             "tp_r2": float(tp_r2_applied),
@@ -1550,6 +1614,11 @@ class LiquiditySweepReversalStrategy(BaseStateMachineStrategy):
             "weekend_k_risk": float(weekend_k_risk),
             "effective_sweep_buffer_atr": float(effective_sweep_buffer_atr),
             "effective_reclaim_window_sec": int(max(1, effective_reclaim_window_sec)),
+            "trend_regime": dict(trend_regime),
+            "trend_aligned": bool(trend_aligned),
+            "trend_counter": bool(trend_counter),
+            "regime_stop_width_mult": float(regime_stop_width_mult),
+            "effective_sl_mult": float(effective_sl_mult),
             **risk_hints,
         }
         return self._emit_entry(
@@ -1646,10 +1715,40 @@ class LiquiditySweepReversalStrategy(BaseStateMachineStrategy):
             return self._hold("INDICATORS_UNAVAILABLE")
 
         ema = None
+        trend_regime: Dict[str, Any] = {
+            "enabled": bool(self.trend_filter_enabled),
+            "direction": "UNKNOWN",
+            "price_vs_ema_atr": None,
+            "ema_slope_atr": None,
+            "ema_period": int(self.trend_filter_ema_period),
+        }
         if self.trend_filter_enabled:
             ema = compute_ema(closed, period=self.trend_filter_ema_period)
             if ema is None:
                 return self._hold("TREND_FILTER_UNAVAILABLE")
+            try:
+                close_for_trend = float(closed["close"].iloc[-1])
+                ema_series = closed["close"].ewm(span=int(self.trend_filter_ema_period), adjust=False).mean()
+                prev_idx = max(0, len(ema_series) - 6)
+                prev_ema = float(ema_series.iloc[prev_idx])
+                ema_slope_atr = (float(ema) - prev_ema) / max(1e-9, float(atr))
+                price_vs_ema_atr = (close_for_trend - float(ema)) / max(1e-9, float(atr))
+                if price_vs_ema_atr > 0.15 and ema_slope_atr >= -0.05:
+                    direction = "UP"
+                elif price_vs_ema_atr < -0.15 and ema_slope_atr <= 0.05:
+                    direction = "DOWN"
+                else:
+                    direction = "RANGE"
+                trend_regime.update(
+                    {
+                        "direction": direction,
+                        "price_vs_ema_atr": float(price_vs_ema_atr),
+                        "ema_slope_atr": float(ema_slope_atr),
+                        "ema": float(ema),
+                    }
+                )
+            except Exception:
+                trend_regime["direction"] = "UNKNOWN"
 
         atr_regime_ratio = self._atr_regime_ratio(closed)
         adx = compute_adx(closed, period=self.adx_period)
@@ -1737,6 +1836,7 @@ class LiquiditySweepReversalStrategy(BaseStateMachineStrategy):
             "atr_regime_ratio": float(atr_regime_ratio) if atr_regime_ratio is not None else None,
             "atr_regime_min_ratio": float(self.atr_regime_min_ratio),
             "adx": float(adx) if adx is not None else None,
+            "trend_regime": dict(trend_regime),
         }
         attrs = getattr(bars, "attrs", {}) if bars is not None else {}
         if isinstance(attrs, dict):

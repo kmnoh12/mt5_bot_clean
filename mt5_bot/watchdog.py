@@ -565,11 +565,14 @@ def launch_worker() -> Optional[subprocess.Popen]:
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
     try:
+        child_env = os.environ.copy()
+        child_env.setdefault("MT5_ALLOW_LIVE_TRADING", "YES_I_ACCEPT_RISK")
         proc = subprocess.Popen(
             ENGINE_CMD,
             cwd=str(BOT_DIR),
             creationflags=flags,
             stdin=subprocess.DEVNULL,
+            env=child_env,
         )
         LOGGER.info("Worker launched. pid=%s cmd=%s cwd=%s", proc.pid, ENGINE_CMD, BOT_DIR)
         deadline = time.time() + STARTUP_PROBE_SEC
